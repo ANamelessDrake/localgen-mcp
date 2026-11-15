@@ -14,7 +14,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). `count` queues several at once with one model load. |
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
-| `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
+| `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). `lods` adds a LOD chain sharing one texture set. Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces` or `retopo_lods`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
 | `rig_creature` | Soft rig for an organic creature: bone chains (`chain` for tentacles, tails and vines; `spine`; `wings` for rays and other flat flyers; `auto` picks) with smooth skin weights, at most 4 per vertex, so engine scripts or physics can bend it. Writes a GLB and an FBX. Headless Blender on the CPU, a few seconds. |
@@ -47,6 +47,13 @@ Generated meshes are about 300k faces with textures baked for that mesh. For a g
     - The quad remeshers have no per-area density, so quad output is uniform.
   - Thin parts far from the new surface can bake with dark specks; a higher `target_faces` reduces them.
   - glTF stores only triangles, so the GLB holds each quad as two triangles; the FBX written beside it keeps the quads and embeds the textures.
+  - **LOD chains:** `lods=[10000, 3000, 800]` (or `generate_mesh(retopo_lods=...)`) writes LOD0, LOD1, LOD2 that share one UV layout and one texture set, so the engine loads one material.
+    - `lods[0]` replaces `target_faces`: LOD0 is the retopology above, with its baked textures.
+    - Each further LOD is a collapse decimation of LOD0 itself (not of the LOD before it), to that many triangles. Blender's collapse interpolates the UVs on each side of a UV seam separately, so LOD0's layout and textures still fit.
+    - One GLB and one FBX hold objects `<name>_LOD0`, `<name>_LOD1`, ...; Unity's FBX importer builds a LOD Group from that suffix. The FBX keeps LOD0's quads; the lower LODs are triangles.
+    - The report lists each LOD's face and triangle counts and a `texture_fit`, measured at each triangle's centre against the nearest point of LOD0: `uv_drift_texels_median` (a few texels when the layout is shared; a fresh unwrap measures about 100) and `colour_mismatch_share` (triangles whose base colour differs from LOD0's there, which grows as small parts collapse). The p90 drift can be large on a correct LOD, because a centre near a seam can find its nearest LOD0 point on the other island.
+    - Detail weighting: with `method="decimate"`, the same detail map (`detail`, `detail_strength`) also steers the LOD decimations, carried from the original to LOD0's vertices. Without it, LODs made from a weighted LOD0 drift back toward uniform density (on the painted test mesh, 0.78 and 0.63 of the faces in the detailed half instead of 0.91 and 0.81). With `method="quad"` the LODs are uniform, like LOD0.
+    - Limits: the lower LODs reuse LOD0's tangent space normal map, which fits less well as the shape simplifies. Strong reductions show it: on a test robot, a quad LOD0 of 18.8k triangles held up well down to 800 triangles, while a decimated LOD0 of 8k triangles taken to 600 grew spikes on thin parts (a direct 600 face decimation of the original has them too, though fewer). Quad LOD0s (the default) chain better.
 
 Quad remeshing uses [Instant Meshes](https://github.com/wjakob/instant-meshes) (BSD) through `pynanoinstantmeshes` in the MCP venv. Blender's own Quadriflow is the fallback but rejects many generated meshes, so expect `decimate` results if that package is missing. Blender (4.2 or later, any build) must be installed; `LOCALGEN_BLENDER` points at a specific one.
 
@@ -219,8 +226,10 @@ uv venv --python 3.12 /ai/venvs/localgen-mcp
 uv pip install --python /ai/venvs/localgen-mcp/bin/python -r setup/mcp-requirements.lock -e .
 /ai/venvs/localgen-mcp/bin/python -m pytest      # no GPU needed: the backend tests run against a fake ComfyUI
 scripts/mcp_call.py --list                       # talk to the server over stdio like an MCP client would
+PYTHONPATH=$PWD/src scripts/mcp_call.py --list   # the server gets this environment, so this runs a checkout's code
 scripts/mcp_call.py generate_image '{"prompt": "a red apple"}'
 blender -b -P scripts/render_glb_views.py -- mesh.glb out/mesh 512   # front, left, back, right stills of a GLB
+blender -b -P scripts/render_glb_views.py -- lods.glb out/lod2 512 0 1 robot_LOD2   # one object only, wireframe on
 ```
 
 The backend tests launch the real supervisor against `tests/fake_comfy/main.py`, a stand-in that answers the same endpoints and records its command line. They cover:

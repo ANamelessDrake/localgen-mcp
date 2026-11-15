@@ -1,7 +1,9 @@
 """Render a GLB from Pixal3D's fixed orbit rig (front, left, back, right).
 
-blender -b -t 8 -P scripts/render_glb_views.py -- in.glb out_prefix [size] [transparent 0|1] [wire 0|1]
+blender -b -t 8 -P scripts/render_glb_views.py -- in.glb out_prefix [size] [transparent 0|1] [wire 0|1] [object]
     [--pose 'REGEX=DEGREES' ...]
+
+object: render only the mesh object of that name (for example one LOD of a LOD chain).
 
 --pose rotates every bone whose name matches REGEX (re.fullmatch) about its
 local X axis, rig_creature's bend axis, after framing the rest pose (so
@@ -30,6 +32,7 @@ src, prefix = argv[0], argv[1]
 size = int(argv[2]) if len(argv) > 2 else 512
 transparent = len(argv) > 3 and argv[3] == "1"
 wire = len(argv) > 4 and argv[4] == "1"  # overlay the mesh edges
+only = argv[5] if len(argv) > 5 else ""  # one object's name, for example "robot_LOD2"
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=src)
@@ -38,6 +41,13 @@ for o in bpy.context.scene.objects:
     if any(c.name.startswith("glTF_not_exported") for c in o.users_collection):
         o.hide_render = True
 meshes = [o for o in bpy.context.scene.objects if o.type == "MESH" and not o.hide_render]
+if only:
+    for o in meshes:
+        if o.name != only:
+            bpy.data.objects.remove(o, do_unlink=True)
+    meshes = [o for o in bpy.context.scene.objects if o.type == "MESH" and not o.hide_render]
+    if not meshes:
+        raise SystemExit(f"no mesh object named {only!r} in {src}")
 
 lo = Vector((1e9,) * 3)
 hi = Vector((-1e9,) * 3)
