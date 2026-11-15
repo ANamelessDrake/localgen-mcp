@@ -26,7 +26,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, jobs, model_files, retopo, workflows
+from . import backend, blender_run, config, jobs, model_files, retopo, speech, workflows
 from .workflows.part_isolate import part_prompt
 
 
@@ -69,7 +69,8 @@ mcp = FastMCP(
         "paths (open them to view). The shared backend starts on the first call (about 10 s, plus model "
         "load) and stops itself after an idle timeout (default 300 s). Pass idle_timeout_seconds, or call "
         "start_backend first, when planning a long batch; call stop_backend when done to free GPU memory. "
-        "Only one large model fits in VRAM at a time; switching modality reloads models."
+        "Only one large model fits in VRAM at a time; switching modality reloads models. "
+        "speak (text to speech) runs on the CPU without the backend; list_voices shows its voices."
     ),
 )
 
@@ -512,6 +513,52 @@ async def _texture(clean, src, prompt, style_image, views, texture_size, denoise
     result["fbx"] = maps["fbx"]
     result["maps"] = maps
     return result
+
+
+# -- speech ---------------------------------------------------------------
+
+
+@mcp.tool()
+async def speak(
+    text: str,
+    voice: str | None = None,
+    speed: float = 1.0,
+    effect: str = "none",
+    intensity: float = 0.5,
+    seed: int | None = None,
+    name: str | None = None,
+    output_dir: str | None = None,
+    keep_dry: bool = True,
+) -> dict:
+    """Speak a line of text (English) to a WAV file, with an optional game voice effect. Runs on the CPU.
+
+    Model: Kokoro-82M (Apache 2.0) in its own venv, offline; ComfyUI and the GPU are not used, so it
+    never waits on image or video jobs. About 10 s to load plus about 1 s per sentence.
+    voice: an installed voice name (see list_voices; default "af_heart"), or a comma separated blend
+    of up to 4 voices with the same accent, averaged ("am_michael,bm_george" is invalid: two accents;
+    "am_michael,am_fenrir" is fine). Prefix a = American, b = British; f = female, m = male.
+    speed: 0.5 to 2.0 (1.0 normal).
+    effect: "none"; "radio" (band limited, compressed, light hiss, like a comms channel); "robotic"
+    (flat buzzing monotone with a metallic echo); "glitch" (a voice struggling on low power: stutters
+    on word onsets, dropouts, bursts of bit crushing). intensity 0 to 1 (default 0.5) scales the effect.
+    seed makes the glitch pattern and noise reproducible (returned in the result either way).
+    name: file name stem for the line (for example "pathfinder_hull_40_lowpower"); an existing file
+    with that name is overwritten. Default: <voice>_<effect>_<random>.
+    keep_dry: with an effect, also keep the unprocessed take as <name>_dry.wav.
+    Output: 24 kHz mono 16 bit WAV, plus an OGG Vorbis copy when ffmpeg is installed, in output_dir
+    (default /ai/output/localgen/audio/<date>/). Returns the paths, duration, sample rate, RMS and peak
+    level, word timings and the seed. Text up to 2000 characters; one call per line of dialogue.
+    """
+    logger.info("speak: %r voice=%s effect=%s", text[:80], voice, effect)
+    return await speech.speak(settings, text, voice, speed, effect, output_dir, intensity, seed, name, keep_dry)
+
+
+@mcp.tool()
+async def list_voices() -> dict:
+    """Text to speech voices installed for speak(): name, accent, gender and Kokoro's quality grade
+    (A best, F worst; higher grades had more and cleaner training audio), the effects available,
+    and whether ffmpeg (for effects and OGG output) was found."""
+    return await asyncio.to_thread(speech.voices_report, settings)
 
 
 # -- backend control ------------------------------------------------------
