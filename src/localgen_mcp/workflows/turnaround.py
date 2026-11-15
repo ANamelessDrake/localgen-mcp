@@ -1,6 +1,20 @@
 """Turnaround: consistent front, left, back and right views of one object from a concept image.
 
-One ComfyUI graph, native nodes only:
+Two modes (p["guide"]); the server runs the stages in order.
+
+guide="mesh" (for flat, winged or wide objects), three stages:
+  stage "front"   FLUX.2 Klein redraws the concept as a clean front view (below), saved alone.
+  (server)        TRELLIS.2 meshes that front view (generate_mesh), and Blender renders the mesh
+                  from the rig's cameras (blender/render_rig_views.py): colour on the plain
+                  background, one scale, the rig's framing.
+  stage "paint"   Klein paints each view image to image from its own render (init = the render,
+                  partial denoise), references [render, clean front, concept], keeping the shape
+                  and only matching the concept's surface. The render pins the pose: from an empty
+                  latent Klein redraws flat or winged objects facing the camera in every view (the
+                  same drift texture_mesh.py avoids the same way). The views are used as rendered,
+                  already rig framed; a BiRefNet mask per view is only their alpha.
+
+guide="none" (default), one graph (stage "full"), native nodes only:
 
   FLUX.2 Klein (add_edit)   a clean front view from the concept (flat even lighting, no cast
                             shadows, plain background), then every other view with references
@@ -33,6 +47,7 @@ import re
 
 from . import Workflow
 from .flux2_klein_4b import MODELS as KLEIN_MODELS, add_edit, add_loaders
+from .image_edit import schedule_steps
 
 # View name -> azimuth in the rig's convention: Z up, azimuth 0 is the front, and the left view
 # (90) sees the object's left side from +X, so in it the object faces image-left.
@@ -90,6 +105,19 @@ def view_prompt(view: str, subject: str) -> str:
             "place as the object turns. " + LIGHTING)
 
 
+def guided_prompt(view: str, subject: str) -> str:
+    return (f"Image 1 is a rough 3D render of {subject}, {WHERE[view]}. Image 2 is its clean front view and "
+            f"image 3 its concept art. Repaint image 1 as the {view.replace('_', ' ')} view of an orthographic 3D "
+            "modelling turnaround of the same object. Keep exactly the same shape, silhouette, pose, size, "
+            "framing and camera as image 1: every part stays where it is in image 1, nothing turns towards the "
+            "viewer. Only improve the surface detail, colours and materials to match images 2 and 3. " + LIGHTING)
+
+
+GUIDES = ("mesh", "none")
+STAGES = ("full", "front", "paint")
+GUIDE_SLOT = "guide_"  # image slot of a view's render: guide_front, guide_left, ...
+
+
 def views_for(three_quarter: bool) -> list[str]:
     return list(ALL_VIEWS if three_quarter else RIG_VIEWS)
 
@@ -121,15 +149,105 @@ def plan(boxes: dict[str, tuple[float, float]], size: int = 1024) -> dict:
                           "height": boxes[v][1] * s * size / side} for v, s in out.items()}}
 
 
+def sampled(views: list[str], symmetric: bool) -> list[str]:
+    """The views Klein draws; with symmetric, the right-hand ones are mirrors instead."""
+    return [v for v in views if not (symmetric and v in MIRROR_OF)]
+
+
 def build(p: dict) -> dict:
+    stage = p.get("stage", "full")
+    if stage == "front":
+        return build_front(p)
+    if stage == "paint":
+        return build_paint(p)
+    return build_full(p)
+
+
+def _add_front(g: dict, p: dict) -> list:
+    g["concept"] = {"class_type": "LoadImage", "inputs": {"image": p["images"]["concept"]}}
+    add_loaders(g)
+    size = int(p["view_size"])
+    return add_edit(g, "front_", front_prompt(p["subject"]), [["concept", 0]], int(p["seed"]), int(p["steps"]),
+                    size, size, upscale="lanczos")
+
+
+def build_front(p: dict) -> dict:
+    """Stage "front": only the clean front view, which the guide mesh is made from."""
+    g: dict = {}
+    front = _add_front(g, p)
+    g["front_save"] = {"class_type": "SaveImage", "inputs": {"images": front,
+                                                              "filename_prefix": f"{p['prefix']}_clean_front"}}
+    return g
+
+
+def _mirror(g: dict, views: list[str], raw: dict, symmetric: bool) -> None:
+    for view, partner in MIRROR_OF.items():
+        if symmetric and view in views:
+            g[f"{view}_mirror"] = {"class_type": "ImageFlip", "inputs": {
+                "image": raw[partner], "flip_method": "y-axis: horizontally"}}
+            raw[view] = [f"{view}_mirror", 0]
+
+
+def _add_sheet(g: dict, p: dict, views: list[str], framed: dict) -> None:
+    sheet = framed[views[0]]
+    for i, view in enumerate(views[1:]):
+        g[f"sheet{i}"] = {"class_type": "ImageStitch", "inputs": {
+            "image1": sheet, "image2": framed[view], "direction": "right", "match_image_size": True,
+            "spacing_width": 0, "spacing_color": "white"}}
+        sheet = [f"sheet{i}", 0]
+    g["sheet_save"] = {"class_type": "SaveImage", "inputs": {"images": sheet, "filename_prefix": f"{p['prefix']}_sheet"}}
+
+
+def _save_rgba(g: dict, p: dict, view: str, image: list, mask: list) -> None:
+    # JoinImageWithAlpha inverts its alpha input (LoadImage's convention), so give it the background.
+    g[f"{view}_alpha_inv"] = {"class_type": "InvertMask", "inputs": {"mask": mask}}
+    g[f"{view}_rgba"] = {"class_type": "JoinImageWithAlpha", "inputs": {
+        "image": image, "alpha": [f"{view}_alpha_inv", 0]}}
+    g[f"{view}_save"] = {"class_type": "SaveImage", "inputs": {
+        "images": [f"{view}_rgba", 0], "filename_prefix": f"{p['prefix']}_view_{view}"}}
+
+
+def build_paint(p: dict) -> dict:
+    """Stage "paint": each view painted image to image from its own render of the guide mesh.
+
+    images: concept, front (the clean front from stage "front") and guide_<view> for every sampled
+    view. The renders are already framed like the rig, so the painted views are saved as they come,
+    with a BiRefNet mask as alpha."""
+    views = ordered(views_for(bool(p.get("three_quarter"))))
+    size, seed = int(p["view_size"]), int(p["seed"])
+    steps, denoise = schedule_steps(int(p["steps"]), float(p["guide_denoise"]))
+    subject, symmetric = p["subject"], bool(p.get("symmetric"))
+    images = p["images"]
+    g: dict = {"concept": {"class_type": "LoadImage", "inputs": {"image": images["concept"]}},
+               "front": {"class_type": "LoadImage", "inputs": {"image": images["front"]}}}
+    add_loaders(g)
+    raw = {}
+    for i, view in enumerate(views):
+        if view not in sampled(views, symmetric):
+            continue
+        g[f"{view}_guide"] = {"class_type": "LoadImage", "inputs": {"image": images[GUIDE_SLOT + view]}}
+        render = [f"{view}_guide", 0]
+        raw[view] = add_edit(g, f"{view}_", guided_prompt(view, subject), [render, ["front", 0], ["concept", 0]],
+                             seed + i, steps, size, size, init=render, denoise=denoise, upscale="lanczos")
+    _mirror(g, views, raw, symmetric)
+    g["bg_model"] = {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": "birefnet.safetensors"}}
+    for view in views:
+        g[f"{view}_mask"] = {"class_type": "RemoveBackground", "inputs": {"bg_removal_model": ["bg_model", 0],
+                                                                          "image": raw[view]}}
+        _save_rgba(g, p, view, raw[view], [f"{view}_mask", 0])
+    _add_sheet(g, p, views, raw)
+    return g
+
+
+def build_full(p: dict) -> dict:
+    """guide="none": every view drawn from an empty latent and framed by silhouette (the module doc)."""
     views = ordered(views_for(bool(p.get("three_quarter"))))
     size, steps, seed = int(p["view_size"]), int(p["steps"]), int(p["seed"])
     subject = p["subject"]
     symmetric = bool(p.get("symmetric"))
-    g: dict = {"concept": {"class_type": "LoadImage", "inputs": {"image": p["images"]["concept"]}}}
-    add_loaders(g)
+    g: dict = {}
+    front = _add_front(g, p)
     concept = ["concept", 0]
-    front = add_edit(g, "front_", front_prompt(subject), [concept], seed, steps, size, size, upscale="lanczos")
     raw = {"front": front}
     for i, view in enumerate(views):
         if view == "front" or (symmetric and view in MIRROR_OF):
@@ -139,11 +257,7 @@ def build(p: dict) -> dict:
         # the first reference (no visible difference).
         raw[view] = add_edit(g, f"{view}_", view_prompt(view, subject), [front, concept], seed + 1 + i, steps,
                              size, size, upscale="lanczos")
-    for view, partner in MIRROR_OF.items():
-        if symmetric and view in views:
-            g[f"{view}_mirror"] = {"class_type": "ImageFlip", "inputs": {
-                "image": raw[partner], "flip_method": "y-axis: horizontally"}}
-            raw[view] = [f"{view}_mirror", 0]
+    _mirror(g, views, raw, symmetric)
 
     g["bg_model"] = {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": "birefnet.safetensors"}}
     bg = p["background"]
@@ -180,26 +294,15 @@ def build(p: dict) -> dict:
                 "crop": "disabled"}}
         g[f"{view}_alpha"] = {"class_type": "ImageToMask", "inputs": {"image": [f"{view}_frame_mask_s", 0],
                                                                       "channel": "red"}}
-        # JoinImageWithAlpha inverts its alpha input (LoadImage's convention), so give it the background.
-        g[f"{view}_alpha_inv"] = {"class_type": "InvertMask", "inputs": {"mask": [f"{view}_alpha", 0]}}
-        g[f"{view}_rgba"] = {"class_type": "JoinImageWithAlpha", "inputs": {
-            "image": [f"{view}_frame_s", 0], "alpha": [f"{view}_alpha_inv", 0]}}
         framed[view] = [f"{view}_frame_s", 0]
-        g[f"{view}_save"] = {"class_type": "SaveImage", "inputs": {
-            "images": [f"{view}_rgba", 0], "filename_prefix": f"{p['prefix']}_view_{view}"}}
+        _save_rgba(g, p, view, framed[view], [f"{view}_alpha", 0])
         g[f"{view}_save_raw"] = {"class_type": "SaveImage", "inputs": {
             "images": raw[view], "filename_prefix": f"{p['prefix']}_raw_{view}"}}
-    sheet = framed[views[0]]
-    for i, view in enumerate(views[1:]):
-        g[f"sheet{i}"] = {"class_type": "ImageStitch", "inputs": {
-            "image1": sheet, "image2": framed[view], "direction": "right", "match_image_size": True,
-            "spacing_width": 0, "spacing_color": "white"}}
-        sheet = [f"sheet{i}", 0]
-    g["sheet_save"] = {"class_type": "SaveImage", "inputs": {"images": sheet, "filename_prefix": f"{p['prefix']}_sheet"}}
+    _add_sheet(g, p, views, framed)
     return g
 
 
-_NAME = re.compile(r"_(view|raw)_([a-z_]+?)_\d+_\.png$|_(sheet)_\d+_\.png$")
+_NAME = re.compile(r"_(view|raw)_([a-z_]+?)_\d+_\.png$|_(sheet|clean_front)_\d+_\.png$")
 
 
 def classify(paths: list[str]) -> dict:
@@ -210,7 +313,7 @@ def classify(paths: list[str]) -> dict:
         if not m:
             continue
         if m.group(3):
-            out["sheet"] = path
+            out[m.group(3)] = path
         elif m.group(2) in ALL_VIEWS:
             out["views" if m.group(1) == "view" else "raw"][m.group(2)] = path
     for key in ("views", "raw"):
@@ -226,6 +329,12 @@ def check(p: dict) -> None:
         raise ValueError("background must be a colour like #d8d8d8")
     if not str(p.get("subject", "")).strip():
         raise ValueError("subject must name the object")
+    if p.get("guide", "mesh") not in GUIDES:
+        raise ValueError(f"guide must be one of {GUIDES}")
+    if p.get("stage", "full") not in STAGES:
+        raise ValueError(f"stage must be one of {STAGES}")
+    if not 0.3 <= float(p.get("guide_denoise", 0.6)) <= 0.95:
+        raise ValueError("guide_denoise must be between 0.3 and 0.95")
 
 
 def _build(p: dict) -> dict:
@@ -241,10 +350,10 @@ WORKFLOW = Workflow(
                  "plus BiRefNet masks"),
     models=list(KLEIN_MODELS) + ["background_removal/birefnet.safetensors"],
     defaults={"subject": "the object", "three_quarter": False, "symmetric": False, "view_size": 1024, "steps": 4,
-              "background": "#d8d8d8"},
+              "background": "#d8d8d8", "guide": "none", "guide_denoise": 0.6, "stage": "full"},
     limits={"view_size": (512, 1536), "steps": (2, 20)},
     build=_build,
-    image_slots=("concept",),
+    image_slots=("concept", "front") + tuple(GUIDE_SLOT + v for v in ALL_VIEWS),
     min_images=1,
     is_default=True,
 )
