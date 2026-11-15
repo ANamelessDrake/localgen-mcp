@@ -18,7 +18,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 mcp==1.30.0
 mcp-types==2.3.0
-numpy==2.5.4
+numpy==1.26.4
 opentelemetry-api==1.45.2
 packaging==26.3
 pluggy==1.7.0
@@ -28,6 +28,7 @@ pydantic-core==2.50.4
 pydantic-settings==2.16.3
 pygments==2.21.0
 pyjwt==2.15.1
+pynanoinstantmeshes==0.0.3
 pytest==9.2.0
 python-dotenv==1.2.4
 python-multipart==0.0.33

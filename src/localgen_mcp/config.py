@@ -44,6 +44,9 @@ class Settings:
     poll_interval: int
     stop_grace: int
     comfy_extra_args: list[str] = field(default_factory=list)
+    blender: str | None = None  # None: find "blender" on PATH
+    blender_threads: int = 8
+    retopo_timeout: int = 1800
 
     @property
     def base_url(self) -> str:
@@ -112,4 +115,7 @@ def load() -> Settings:
         poll_interval=_env_int("LOCALGEN_POLL_INTERVAL", 5),
         stop_grace=_env_int("LOCALGEN_STOP_GRACE", 20),
         comfy_extra_args=os.environ.get("LOCALGEN_COMFY_ARGS", "").split(),
+        blender=os.environ.get("LOCALGEN_BLENDER") or None,
+        blender_threads=max(1, _env_int("LOCALGEN_BLENDER_THREADS", 8)),
+        retopo_timeout=_env_int("LOCALGEN_TIMEOUT_RETOPO", 1800),
     )

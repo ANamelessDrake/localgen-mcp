@@ -14,6 +14,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). `count` queues several at once with one model load. |
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
+| `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -26,6 +27,19 @@ Pixal3D assumes a fixed camera rig: views 90 degrees apart, the object centred a
 - `framing="crop"` (default, as in ComfyUI's template) crops each view to its own outline. This keeps the scale when the object's widest extent is the same in every view, as for a standing figure or a character turnaround sheet. For an object much wider from the front than the side it stretches the side views, and the mesh comes out too deep.
 - `framing="as_framed"` uses square views exactly as given. Use it for 3D renders or turnarounds already framed like the rig (object about 1/1.1 of the frame at its widest, 20 degree horizontal FOV); `scripts/render_glb_views.py` renders that framing.
 - `remove_background=false` takes the mask from the images' own alpha channel instead of BiRefNet.
+
+### Retopology
+
+Generated meshes are about 300k faces with textures baked for that mesh. For a game asset:
+- `generate_mesh(face_count=...)` (5000 or more) decimates inside the generation and bakes the textures straight from the model's voxels: the best texture quality, but triangles.
+- `retopologize_mesh` (or `generate_mesh(retopo_faces=...)`) rebuilds the topology of any GLB.
+  - `method="quad"` (default) gives an even all-quad mesh, suited to rigging and deformation.
+  - `method="decimate"` gives triangles that keep the silhouette closest.
+  - It then unwraps new UVs and bakes base color, roughness, metallic and a tangent space normal map from the original with Cycles on the CPU. Colour values are copied byte for byte (a test checks this).
+  - Thin parts far from the new surface can bake with dark specks; a higher `target_faces` reduces them.
+  - glTF stores only triangles, so the GLB holds each quad as two triangles; the FBX written beside it keeps the quads and embeds the textures.
+
+Quad remeshing uses [Instant Meshes](https://github.com/wjakob/instant-meshes) (BSD) through `pynanoinstantmeshes` in the MCP venv. Blender's own Quadriflow is the fallback but rejects many generated meshes, so expect `decimate` results if that package is missing. Blender (4.2 or later, any build) must be installed; `LOCALGEN_BLENDER` points at a specific one.
 
 ### Idle timeout
 
@@ -63,7 +77,8 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Video, image to video, warm | same, 33 frames | 30 s | 11.8 GB |
 | Mesh, one image | TRELLIS.2, resolution 1024, 2048 px textures, 300k faces | 76 s (GLB 16.9 MB, 162k vertices) | 11.5 GB |
 | Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
-| Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 96 s | |
+| Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
+| Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
@@ -72,7 +87,7 @@ Mesh quality was checked by rendering each GLB from the four rig views in Blende
 
 ## Install or rebuild
 
-Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12.
+Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found.
 
 ```bash
 setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
@@ -135,6 +150,9 @@ Run state, all under `<root>/run/localgen`: `start.lock`, `supervisor.lock`, `su
 | `LOCALGEN_COMFY_ARGS` | | Extra ComfyUI flags, for example `--lowvram` |
 | `LOCALGEN_OUTPUT_DIR`, `LOCALGEN_LOG_DIR`, `LOCALGEN_RUN_DIR` | under the root | |
 | `LOCALGEN_MCP_LOG_LEVEL`, `LOCALGEN_MCP_LOG_FILE` | `INFO` | Server logs go to stderr |
+| `LOCALGEN_BLENDER` | `blender` on `PATH` | For retopology |
+| `LOCALGEN_BLENDER_THREADS` | 8 | CPU threads for Blender's bake |
+| `LOCALGEN_TIMEOUT_RETOPO` | 1800 s | |
 
 ## Adding a model
 

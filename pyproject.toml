@@ -14,6 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Quad retopology (Instant Meshes); without it retopologize_mesh falls back to Blender's Quadriflow.
+retopo = [
+    "numpy==1.26.4",
+    "pynanoinstantmeshes==0.0.3",
+]
 dev = [
     "pytest==9.2.0",
     "trimesh==5.2.1",

@@ -78,6 +78,14 @@ if command -v nvidia-smi >/dev/null; then
     fi
 fi
 say "  PyTorch CUDA build: ${CUDA:-unknown}"
+# Blender is optional: only retopologize_mesh (and generate_mesh retopo_faces) needs it.
+if command -v blender >/dev/null; then
+    say "  ok: blender ($(blender --version 2>/dev/null | head -1))"
+else
+    say "  optional, not found: blender (needed for retopologize_mesh). Install the distribution"
+    say "    package (Fedora: sudo dnf install blender; Debian/Ubuntu: sudo apt install blender)"
+    say "    or set LOCALGEN_BLENDER to a Blender 4.2 or later executable."
+fi
 (( missing )) && { say "Install the missing tools and rerun."; exit 1; }
 
 # -- directories -----------------------------------------------------------

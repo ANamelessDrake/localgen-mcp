@@ -21,7 +21,7 @@ import sys
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, config, jobs, workflows
+from . import backend, config, jobs, retopo, workflows
 
 
 def _configure_logging() -> logging.Logger:
@@ -161,6 +161,8 @@ async def generate_mesh(
     face_count: int | None = None,
     remove_background: bool = True,
     framing: str = "crop",
+    retopo_faces: int | None = None,
+    retopo_method: str = "quad",
     seed: int | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
@@ -179,6 +181,9 @@ async def generate_mesh(
     uses square views exactly as given (object centred, about 1/1.1 of the frame at its widest, one
     scale for all views, as from a 3D render rig at 20 degrees horizontal FOV).
     remove_background=False uses the image's own alpha channel instead of BiRefNet.
+    retopo_faces (for example 10000): also make a game weight copy with retopologize_mesh
+    (retopo_method "quad" or "decimate"); the result's "retopo" entry has its path. For a plain
+    triangle mesh at a given size, face_count alone does it inside the generation.
     Returns the GLB path, the reference image path when one was generated, seed, settings and timings.
     """
     if not input_image and not prompt:
@@ -210,7 +215,32 @@ async def generate_mesh(
     if reference is not None:
         result["reference_image"] = reference["paths"][0]
         result["reference_image_seconds"] = reference["total_seconds"]
+    if retopo_faces:
+        result["retopo"] = await retopo.retopologize(settings, result["paths"][0], retopo_faces,
+                                                     retopo_method, texture_size or 2048, output_dir)
     return result
+
+
+@mcp.tool()
+async def retopologize_mesh(
+    input_mesh: str,
+    target_faces: int = 10000,
+    method: str = "quad",
+    texture_size: int = 2048,
+    output_dir: str | None = None,
+) -> dict:
+    """Make a game weight copy of a textured GLB: new topology, new UVs, and baked PBR textures.
+
+    method "quad" (default): an all quad mesh with even edge flow (Instant Meshes), suited to
+    rigging, deformation and further modelling. "decimate": triangles, closest silhouette.
+    The new mesh gets a fresh UV layout, and base color, roughness, metallic and a tangent space
+    normal map baked from the original (target_faces 200 to 500000, texture_size 256 to 8192).
+    Runs in headless Blender on the CPU, about 10 to 30 s at 10k faces; the GPU is not used.
+    Output: <output_dir or the input's folder>/<name>_retopo_<method>_<faces>.glb, plus an .fbx
+    with embedded textures that keeps real quads (glTF stores only triangles).
+    Returns the path, face and vertex counts before and after, the method that ran and timings.
+    """
+    return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir)
 
 
 # -- backend control ------------------------------------------------------

@@ -1,6 +1,6 @@
 """Render a GLB from Pixal3D's fixed orbit rig (front, left, back, right).
 
-blender -b -t 8 -P scripts/render_glb_views.py -- in.glb out_prefix [size] [transparent 0|1]
+blender -b -t 8 -P scripts/render_glb_views.py -- in.glb out_prefix [size] [transparent 0|1] [wire 0|1]
 
 The mesh is scaled so its largest bounding box side is 1 and centred at the
 origin, as the rig assumes; cameras follow nodes_trellis2._orbit_camera_to_world
@@ -16,6 +16,7 @@ argv = sys.argv[sys.argv.index("--") + 1:]
 src, prefix = argv[0], argv[1]
 size = int(argv[2]) if len(argv) > 2 else 512
 transparent = len(argv) > 3 and argv[3] == "1"
+wire = len(argv) > 4 and argv[4] == "1"  # overlay the mesh edges
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=src)
@@ -34,6 +35,24 @@ for o in bpy.context.scene.objects:
     if o.parent is None:
         o.matrix_world = fix @ o.matrix_world
 print(f"bbox extent {tuple(round(v, 3) for v in (hi - lo))}, scaled by {1 / extent:.4f}")
+
+if wire:
+    # Draw edges with Cycles' Wireframe node mixed into each material (no extra geometry).
+    for mat in {s.material for o in meshes for s in o.material_slots if s.material}:
+        mat.use_nodes = True
+        nt = mat.node_tree
+        out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output)
+        surface = out.inputs["Surface"].links[0].from_socket
+        mix = nt.nodes.new("ShaderNodeMixShader")
+        edge = nt.nodes.new("ShaderNodeWireframe")
+        edge.use_pixel_size = True
+        edge.inputs["Size"].default_value = 1.0
+        ink = nt.nodes.new("ShaderNodeBsdfDiffuse")
+        ink.inputs["Color"].default_value = (0.01, 0.01, 0.01, 1)
+        nt.links.new(edge.outputs["Fac"], mix.inputs["Fac"])
+        nt.links.new(surface, mix.inputs[1])
+        nt.links.new(ink.outputs[0], mix.inputs[2])
+        nt.links.new(mix.outputs[0], out.inputs["Surface"])
 
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
