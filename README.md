@@ -17,6 +17,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
+| `upscale_image` | Upscale a PNG or JPEG 2x or 4x with a super resolution model: Real-ESRGAN x4plus for concept art and general images, or 4x-PBRify V4 (`model="pbrify-v4"`) for game textures. Keeps transparency. A few seconds to a minute. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -72,6 +73,14 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
+### Upscaling
+
+`upscale_image` runs a 4x super resolution model with ComfyUI's native `UpscaleModelLoader` and `ImageUpscaleWithModel` nodes.
+- **Models:** `realesrgan-x4plus` (default) is a general upscaler that also cleans up mild noise and JPEG artefacts; it suits concept art, renders and photos. `pbrify-v4` is trained on game textures and keeps more fine surface detail, at about 3 times the run time. Both allow commercial use (BSD-3-Clause and CC0); see [docs/model-choices.md](docs/model-choices.md#upscaling-added-2026-11-15).
+- **Scale:** 4 is the models' native scale. 2 downscales the 4x result by half with Lanczos, so one model serves both scales.
+- **Alpha:** a PNG with transparency keeps it (`keep_alpha=false` drops it). The model upscales the colour, and the alpha channel is resized bilinearly. Colour hidden under fully transparent pixels is upscaled too, so edges look as clean as the source's.
+- **Large images:** the upscale node works in 512 px tiles (halved if the GPU runs out of memory), so VRAM is not the limit. The result is limited to 8192 px per side: 2048 px inputs at 4x, 4096 px at 2x. Output is an 8-bit PNG named `<input>_x<scale>.png`.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -90,6 +99,8 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 | Video | Wan 2.2 TI2V 5B fp16 | Apache 2.0 | 18.15 GB |
 | Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
 | Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
+| Upscaling, general | Real-ESRGAN x4plus | BSD-3-Clause | 67 MB |
+| Upscaling, game textures | 4x-PBRify UpscalerV4 (DAT2) | CC0-1.0 | 140 MB |
 
 All of them use native ComfyUI nodes; no custom nodes are installed.
 
@@ -111,6 +122,8 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
+| Upscale 4x, `realesrgan-x4plus` | 1024x1024 to 4096x4096; 1536x1024 to 6144x4096 | 8.7 s; 12.1 s | |
+| Upscale, `pbrify-v4` | 1024x1024, scale 2 (4x run, then Lanczos) | 25.0 s | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
@@ -125,13 +138,13 @@ Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.ast
 setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
 setup/install.sh --root /ai --dry-run  # show what would be done, change nothing
 setup/install.sh --skip-models         # software only
-setup/download-models.sh --only video  # weights for one group (image, video, mesh); --verify rechecks SHA256
+setup/download-models.sh --only video  # weights for one group (image, video, mesh, upscale); --verify rechecks SHA256
 ```
 
 What gets pinned:
 - ComfyUI at commit `e08cc003` (0.45.0).
 - Both venvs from frozen lock files (`setup/comfyui-requirements.lock`, `setup/mcp-requirements.lock`).
-- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`).
+- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`). The upscale models exist only as GitHub release assets, so those entries name the release tag and are pinned by SHA256.
 
 Everything large lives under the install root: weights, venvs, uv's cache and managed Pythons, logs, outputs and temp files. Nothing goes in `/tmp` or the home directory. The scripts are idempotent; rerun them after an interruption.
 
