@@ -67,6 +67,10 @@ def test_trellis_without_background_removal_uses_alpha():
     g = wf.build(_params(wf, images={"image": "localgen/a.png"}, remove_background=False))
     _check_graph(g)
     assert not any(n["class_type"].startswith("BiRefNet") or "BackgroundRemoval" in n["class_type"] for n in g.values())
+    # LoadImage's mask output is 1 - alpha; the crop needs the foreground, so it must be inverted.
+    mask = g["312"]["inputs"]["masks"]
+    assert g[mask[0]]["class_type"] == "InvertMask"
+    assert g[mask[0]]["inputs"]["mask"] == ["122", 1]
 
 
 def test_limits_enforced():
@@ -123,6 +127,39 @@ def test_pixal3d_multiview_feeds_each_view():
     assert g["40"]["inputs"]["unet_name"].startswith("pixal3d_multiview")
     assert "Trellis2Conditioning" not in _classes(g)
     assert _classes(g).count("RemoveBackground") == 2
+    assert _classes(g).count("ImageCropToMask") == 2
+
+
+def _source(g, ref):
+    return g[ref[0]]
+
+
+def test_pixal3d_as_framed_keeps_framing():
+    wf = workflows.get("mesh", "pixal3d-multiview")
+    for remove_bg in (True, False):
+        g = wf.build(_params(wf, images={"front": "f.png", "left": "l.png"}, framing="as_framed",
+                             remove_background=remove_bg))
+        _check_graph(g)
+        assert "ImageCropToMask" not in _classes(g)
+        for slot in ("front", "left"):
+            join = _source(g, g["299"]["inputs"][slot])
+            assert join["class_type"] == "JoinImageWithAlpha"
+            # JoinImageWithAlpha wants the background (it inverts), so the foreground is inverted first.
+            inv = _source(g, join["inputs"]["alpha"])
+            assert inv["class_type"] == "InvertMask"
+            fg = _source(g, inv["inputs"]["mask"])
+            if remove_bg:
+                assert fg["class_type"] == "RemoveBackground"
+            else:
+                # alpha path: LoadImage mask (1 - alpha) inverted to the foreground, then back
+                assert fg["class_type"] == "InvertMask"
+                assert _source(g, fg["inputs"]["mask"])["class_type"] == "LoadImage"
+
+
+def test_pixal3d_rejects_unknown_framing():
+    wf = workflows.get("mesh", "pixal3d-multiview")
+    with pytest.raises(ValueError):
+        wf.build(_params(wf, images={"front": "f.png"}, framing="stretch"))
 
 
 def test_only_real_images_are_uploaded(tmp_path):

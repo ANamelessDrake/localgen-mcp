@@ -13,12 +13,19 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 |---|---|
 | `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). `count` queues several at once with one model load. |
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
-| `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view). |
+| `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
 
 Every generation tool takes optional `output_dir`, `seed`, `model` and `idle_timeout_seconds`. Outputs default to `/ai/output/localgen/<modality>/<date>/`. Long jobs send MCP progress notifications.
+
+### Multi-view framing
+
+Pixal3D assumes a fixed camera rig: views 90 degrees apart, the object centred and at the same scale in every view.
+- `framing="crop"` (default, as in ComfyUI's template) crops each view to its own outline. This keeps the scale when the object's widest extent is the same in every view, as for a standing figure or a character turnaround sheet. For an object much wider from the front than the side it stretches the side views, and the mesh comes out too deep.
+- `framing="as_framed"` uses square views exactly as given. Use it for 3D renders or turnarounds already framed like the rig (object about 1/1.1 of the frame at its widest, 20 degree horizontal FOV); `scripts/render_glb_views.py` renders that framing.
+- `remove_background=false` takes the mask from the images' own alpha channel instead of BiRefNet.
 
 ### Idle timeout
 
@@ -55,10 +62,13 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Video, defaults, cold start | Wan 2.2 5B, 1280x704, 49 frames, 20 steps | 168 s, 174 s | 11.8 GB |
 | Video, image to video, warm | same, 33 frames | 30 s | 11.8 GB |
 | Mesh, one image | TRELLIS.2, resolution 1024, 2048 px textures, 300k faces | 76 s (GLB 16.9 MB, 162k vertices) | 11.5 GB |
-| Mesh, four views | Pixal3D multi-view, same settings | 74 s (GLB 17.2 MB, 164k vertices) | 11.3 GB |
+| Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
+| Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 96 s | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
+
+Mesh quality was checked by rendering each GLB from the four rig views in Blender (`scripts/render_glb_views.py`). The test was Pixal3D fed four renders of a TRELLIS.2 teapot. With `framing="as_framed"` it reproduced the original's proportions: a bounding box of 0.993 x 0.609 x 0.654 against 1.0 x 0.614 x 0.654, with one handle and one spout. With `crop` the same views produced a body as wide from the side as from the front.
 
 ## Install or rebuild
 
@@ -141,6 +151,7 @@ uv pip install --python /ai/venvs/localgen-mcp/bin/python -r setup/mcp-requireme
 /ai/venvs/localgen-mcp/bin/python -m pytest      # no GPU needed: the backend tests run against a fake ComfyUI
 scripts/mcp_call.py --list                       # talk to the server over stdio like an MCP client would
 scripts/mcp_call.py generate_image '{"prompt": "a red apple"}'
+blender -b -P scripts/render_glb_views.py -- mesh.glb out/mesh 512   # front, left, back, right stills of a GLB
 ```
 
 The backend tests launch the real supervisor against `tests/fake_comfy/main.py`, a stand-in that answers the same endpoints and records its command line. They cover:

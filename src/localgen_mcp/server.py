@@ -160,6 +160,7 @@ async def generate_mesh(
     texture_size: int | None = None,
     face_count: int | None = None,
     remove_background: bool = True,
+    framing: str = "crop",
     seed: int | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
@@ -173,6 +174,10 @@ async def generate_mesh(
     Default model: TRELLIS.2 with shape resolution 1024, 2048 px textures, 300k faces.
     Multi-view: also give left_image, back_image and/or right_image (views 90 degrees apart at the
     same scale, input_image being the front) to use Pixal3D multi-view instead.
+    framing (multi-view only): "crop" (default) crops each view to its own outline, which suits
+    figures; it stretches the side views of objects wider from the front than the side. "as_framed"
+    uses square views exactly as given (object centred, about 1/1.1 of the frame at its widest, one
+    scale for all views, as from a 3D render rig at 20 degrees horizontal FOV).
     remove_background=False uses the image's own alpha channel instead of BiRefNet.
     Returns the GLB path, the reference image path when one was generated, seed, settings and timings.
     """
@@ -197,6 +202,8 @@ async def generate_mesh(
     wf = workflows.pick("mesh", model, set(images))
     overrides = {"resolution": resolution, "texture_size": texture_size, "face_count": face_count,
                  "remove_background": remove_background, "seed": seed}
+    if "framing" in wf.defaults:
+        overrides["framing"] = framing
     logger.info("generate_mesh: %s (%s)", images, wf.name)
     result = await jobs.run_workflow(settings, wf, [overrides], output_dir, idle_timeout_seconds,
                                      images=images, timeout=TIMEOUTS["mesh"], progress=_progress(ctx))

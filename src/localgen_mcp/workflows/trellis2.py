@@ -30,7 +30,9 @@ def build(p: dict) -> dict:
     g["900"]["inputs"]["filename_prefix"] = p["prefix"]
     if not p.get("remove_background", True):
         # Use the image's own alpha channel as the mask instead of BiRefNet.
-        g["312"]["inputs"]["masks"] = ["122", 1]
+        # LoadImage's mask output is 1 - alpha (background = 1), so invert it.
+        g["alpha"] = {"class_type": "InvertMask", "inputs": {"mask": ["122", 1]}}
+        g["312"]["inputs"]["masks"] = ["alpha", 0]
         del g["192"], g["193"]
     return g
 
