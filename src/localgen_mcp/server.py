@@ -514,6 +514,82 @@ async def _texture(clean, src, prompt, style_image, views, texture_size, denoise
     return result
 
 
+@mcp.tool()
+async def generate_turnaround(
+    concept_image: str | None = None,
+    prompt: str | None = None,
+    subject: str | None = None,
+    three_quarter: bool = False,
+    symmetric: bool = False,
+    background: str = "#d8d8d8",
+    mesh: bool = False,
+    view_size: int | None = None,
+    steps: int | None = None,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Make consistent turnaround views of one object (front, left, back, right) from a concept image.
+
+    Give concept_image (a local PNG or JPEG of the object, any angle), or only prompt to generate the
+    concept first with the image model. subject: a few words naming the object and its key parts
+    ("a salvage robot with a cargo cage on its back and tread feet"); it goes into every view's prompt
+    and defaults to prompt. Naming the parts helps them appear in every view.
+    FLUX.2 Klein first redraws the concept as a clean front view (flat even lighting, no cast shadows,
+    plain background), then draws each other view from that front and the concept. Views follow
+    Pixal3D's rig: the left view shows the object's own left side, facing image-left.
+    three_quarter=True adds front_left, back_left, back_right and front_right views (for reference;
+    meshing uses the four main views). symmetric=True draws only the left-hand views and mirrors them
+    into the right-hand ones, which keeps a left-right symmetric object consistent (do not use it for
+    asymmetric objects).
+    Every view is framed for Pixal3D: square, the object centred, the same scale in every view (each
+    view is scaled to the same silhouette height, which assumes a standing object seen level), the
+    widest view at 1/1.1 of the frame. Views are RGBA PNGs (alpha is the foreground) on `background`;
+    a sheet puts them side by side.
+    mesh=True also meshes the four views with generate_mesh's multi-view path (framing "as_framed").
+    Views are generated, so they can still disagree on details: look at them before relying on them.
+    Returns the view paths by name, the raw (unframed) views, the sheet, the concept, and the mesh
+    result when asked. About 6 s per view warm, plus model loads.
+    """
+    from .workflows import turnaround
+
+    if not concept_image and not prompt:
+        raise ValueError("give concept_image or prompt")
+    wf = workflows.get("turnaround")
+    overrides = {"subject": (subject or prompt or "the object").strip().rstrip("."), "three_quarter": three_quarter,
+                 "symmetric": symmetric, "background": background, "view_size": view_size, "steps": steps,
+                 "seed": seed}
+    turnaround.check(wf.params(overrides))  # fail on bad options before any GPU work
+    concept = None
+    if concept_image:
+        path = Path(concept_image).expanduser().resolve()
+        if not path.is_file() or not jobs.is_image_file(path):
+            raise ValueError(f"concept_image must be a PNG or JPEG image: {path}")
+        concept = str(path)
+    progress = _progress(ctx)
+    reference = None
+    if concept is None:
+        reference = await generate_image(prompt + turnaround.CONCEPT_SUFFIX, seed=seed, output_dir=output_dir,
+                                         idle_timeout_seconds=idle_timeout_seconds, ctx=ctx)
+        concept = reference["paths"][0]
+    logger.info("generate_turnaround: %s (%s)", concept, wf.name)
+    result = await jobs.run_workflow(settings, wf, [overrides], output_dir, idle_timeout_seconds,
+                                     images={"concept": concept}, timeout=TIMEOUTS["image"], progress=progress)
+    result.update(turnaround.classify(result["paths"]))
+    result["concept_image"] = concept
+    if reference is not None:
+        result["concept_seconds"] = reference["total_seconds"]
+    if mesh:
+        v = result["views"]
+        result["mesh"] = await generate_mesh(input_image=v["front"], left_image=v.get("left"),
+                                             back_image=v.get("back"), right_image=v.get("right"),
+                                             framing="as_framed", remove_background=False, seed=seed,
+                                             output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds,
+                                             ctx=ctx)
+    return result
+
+
 # -- backend control ------------------------------------------------------
 
 
