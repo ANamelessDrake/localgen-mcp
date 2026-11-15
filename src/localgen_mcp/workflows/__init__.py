@@ -18,13 +18,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-_MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh", "part_isolate"]
+_MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh", "part_isolate", "upscale"]
 
 
 @dataclass(frozen=True)
 class Workflow:
     name: str
-    modality: str                      # image | video | mesh | texture
+    modality: str                      # image | video | mesh | texture | part | upscale
     description: str
     models: list[str]                  # files under the ComfyUI models dir
     defaults: dict[str, Any]
@@ -66,8 +66,9 @@ class Workflow:
 def _load() -> dict[str, Workflow]:
     found = {}
     for mod in _MODULES:
-        wf = importlib.import_module(f"{__name__}.{mod}").WORKFLOW
-        found[wf.name] = wf
+        module = importlib.import_module(f"{__name__}.{mod}")
+        for wf in getattr(module, "WORKFLOWS", None) or [module.WORKFLOW]:  # one module may define several
+            found[wf.name] = wf
     return found
 
 

@@ -3,11 +3,13 @@
 # One file per line, whitespace separated:
 #   group  target  repo  revision  path_in_repo  size_bytes  sha256
 #
-# group   image | video | mesh (select with download-models.sh --only GROUP)
+# group   image | video | mesh | upscale (select with download-models.sh --only GROUP)
 # target  path relative to the ComfyUI models directory (<install root>/ComfyUI/models)
 # repo    Hugging Face repo id; files are fetched from
 #         https://huggingface.co/<repo>/resolve/<revision>/<path_in_repo>
 # revision is a pinned commit so a rebuild gets byte identical files.
+#         repo "github:<owner>/<name>" instead fetches the release asset path_in_repo of the
+#         release tagged revision; the sha256 is what pins it, since tags can move.
 # See docs/model-choices.md for why each model was chosen.
 
 # Image: Z-Image Turbo (Apache 2.0)
@@ -34,3 +36,9 @@ mesh background_removal/birefnet.safetensors              Comfy-Org/BiRefNet 884
 
 # Multi-view mesh: Pixal3D multi-view (front, left, back, right views). Shares the TRELLIS.2 VAEs, DINOv3 and BiRefNet above.
 mesh diffusion_models/pixal3d_multiview_int8_convrot.safetensors Comfy-Org/Pixal3D f37641be376725d324c56626007cc477f1249a69 diffusion_models/pixal3d_multiview_int8_convrot.safetensors 5584555824 6b1eb3328930d921d3b57508d9c46cceec1c174dcedeebc14f176ab67d49f477
+
+# Upscale: Real-ESRGAN x4plus (BSD-3-Clause, the only published copy is the GitHub release; loaded with
+# torch weights_only) and 4x-PBRify_UpscalerV4 for textures (CC0-1.0, trained on CC0 ambientCG textures).
+# SHA256 of the .pth files matches the OpenModelDB catalogue; the PBRify safetensors holds the same tensors as its .pth.
+upscale upscale_models/RealESRGAN_x4plus.pth github:xinntao/Real-ESRGAN v0.1.0 RealESRGAN_x4plus.pth 67040989 4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1
+upscale upscale_models/4x-PBRify_UpscalerV4.safetensors github:Kim2091/Kim2091-Models 4x-PBRify_UpscalerV4 4x-PBRify_UpscalerV4.safetensors 139793020 a00fa50116895a9b766aeb012edad0a14d66f3afda65539efc0f6fc28c991ba2

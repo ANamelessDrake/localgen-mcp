@@ -623,6 +623,79 @@ async def list_voices() -> dict:
     and whether ffmpeg (for effects and OGG output) was found."""
     return await asyncio.to_thread(speech.voices_report, settings)
 
+# -- upscaling ------------------------------------------------------------
+
+UPSCALE_MAX_SIDE = 8192  # longest side of the result, in pixels
+
+
+def _upscale_input(input_image: str, scale: int) -> tuple[Path, int, int, bool]:
+    """Validate an upscale input; returns its path, size and whether it is a PNG with alpha."""
+    if scale not in (2, 4):
+        raise ValueError("scale must be 2 or 4")
+    src = Path(input_image).expanduser().resolve()
+    if not src.is_file():
+        raise ValueError(f"input image not found: {src}")
+    if not jobs.is_image_file(src):  # checked by content: only real images are uploaded
+        raise ValueError(f"not an image file: {src}")
+    try:
+        width, height = jobs.image_size(src)
+    except jobs.JobError:
+        raise ValueError(f"input_image must be a PNG or JPEG: {src}") from None
+    if min(width, height) < 16:
+        raise ValueError(f"input image is {width}x{height}; it must be at least 16 px on each side")
+    if max(width, height) * scale > UPSCALE_MAX_SIDE:
+        raise ValueError(f"{width}x{height} at {scale}x would be {width * scale}x{height * scale}; the result "
+                         f"is limited to {UPSCALE_MAX_SIDE} px per side (use scale 2, or crop the image first)")
+    return src, width, height, jobs.png_has_alpha(src)
+
+
+@mcp.tool()
+async def upscale_image(
+    input_image: str,
+    scale: int = 4,
+    model: str | None = None,
+    keep_alpha: bool = True,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Upscale an image (PNG or JPEG) 2x or 4x with a super resolution model, adding plausible detail.
+
+    model: "realesrgan-x4plus" (default; general purpose, suits concept art, renders and photos, and
+    cleans up mild noise and JPEG artefacts) or "pbrify-v4" (made for game textures such as albedo,
+    roughness or normal maps; keeps fine surface detail; about 3 times slower).
+    scale: 4 (the models' native scale) or 2 (the 4x result downscaled by half with Lanczos).
+    keep_alpha: a PNG with transparency keeps it; the alpha channel is upscaled smoothly, the colour
+    by the model. keep_alpha=False writes an opaque RGB PNG.
+    Large images are processed in tiles inside the backend, so any size fits in VRAM; the result is
+    limited to 8192 px per side (for example 2048 px at 4x, 4096 px at 2x) and is an 8-bit PNG.
+    Measured on this GPU: about 0.5 s per megapixel of 4x output with the default model and 1.5 s
+    with pbrify-v4 (a 1024 px image takes about 9 s and 25 s), plus any wait for the shared queue.
+    Output: <output_dir or /ai/output/localgen/upscale/<date>>/<input name>_x<scale>.png.
+    Returns the path, input and output sizes, whether alpha was kept, and timings.
+    """
+    src, width, height, alpha = await asyncio.to_thread(_upscale_input, input_image, scale)
+    wf = workflows.pick("upscale", model, {"image"})
+    keep = keep_alpha and alpha
+    logger.info("upscale_image: %s %dx%d x%d alpha=%s (%s)", src, width, height, scale, keep, wf.name)
+    result = await jobs.run_workflow(settings, wf, [{"scale": scale, "alpha": keep}], output_dir,
+                                     idle_timeout_seconds, images={"image": str(src)},
+                                     timeout=TIMEOUTS["image"], progress=_progress(ctx))
+    out = Path(result["paths"][0])
+    final = out.with_name(f"{src.stem}_x{scale}.png")
+    n = 1
+    while final.exists():
+        n += 1
+        final = out.with_name(f"{src.stem}_x{scale}_{n}.png")
+    out.rename(final)
+    result["paths"] = [str(final)]
+    result["outputs"][0]["paths"] = [str(final)]
+    result["upscaled_image"] = str(final)
+    result["input_size"] = [width, height]
+    result["output_size"] = [width * scale, height * scale]
+    result["alpha_kept"] = keep
+    return result
+
 
 # -- backend control ------------------------------------------------------
 
