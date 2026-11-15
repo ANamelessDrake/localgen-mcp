@@ -134,14 +134,11 @@ def build(p: dict) -> dict:
     for i, view in enumerate(views):
         if view == "front" or (symmetric and view in MIRROR_OF):
             continue
-        refs = [front, concept] if p.get("ref_order", "front_first") == "front_first" else [concept, front]
-        init, denoise = None, 1.0
-        if view == "back" and p.get("back_start") == "mirror":
-            # A rough start: the front flipped has the back's silhouette, left on the image's left.
-            g["back_flip"] = {"class_type": "ImageFlip", "inputs": {"image": front, "flip_method": "y-axis: horizontally"}}
-            init, denoise = ["back_flip", 0], float(p["back_denoise"])
-        raw[view] = add_edit(g, f"{view}_", view_prompt(view, subject), refs, seed + 1 + i, steps, size, size,
-                             init=init, denoise=denoise, upscale="lanczos")
+        # From an empty latent. Tried and dropped: starting the back from the mirrored front (at
+        # denoise 0.9 it changed nothing visible, at 0.7 the back kept the face) and the concept as
+        # the first reference (no visible difference).
+        raw[view] = add_edit(g, f"{view}_", view_prompt(view, subject), [front, concept], seed + 1 + i, steps,
+                             size, size, upscale="lanczos")
     for view, partner in MIRROR_OF.items():
         if symmetric and view in views:
             g[f"{view}_mirror"] = {"class_type": "ImageFlip", "inputs": {
@@ -227,12 +224,6 @@ _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 def check(p: dict) -> None:
     if not _HEX.match(str(p.get("background", ""))):
         raise ValueError("background must be a colour like #d8d8d8")
-    if p.get("back_start") not in ("none", "mirror"):
-        raise ValueError("back_start must be 'none' or 'mirror'")
-    if p.get("ref_order") not in ("front_first", "concept_first"):
-        raise ValueError("ref_order must be 'front_first' or 'concept_first'")
-    if not 0.5 <= float(p.get("back_denoise", 0.9)) <= 1.0:
-        raise ValueError("back_denoise must be between 0.5 and 1.0")
     if not str(p.get("subject", "")).strip():
         raise ValueError("subject must name the object")
 
@@ -250,7 +241,7 @@ WORKFLOW = Workflow(
                  "plus BiRefNet masks"),
     models=list(KLEIN_MODELS) + ["background_removal/birefnet.safetensors"],
     defaults={"subject": "the object", "three_quarter": False, "symmetric": False, "view_size": 1024, "steps": 4,
-              "background": "#d8d8d8", "ref_order": "front_first", "back_start": "none", "back_denoise": 0.9},
+              "background": "#d8d8d8"},
     limits={"view_size": (512, 1536), "steps": (2, 20)},
     build=_build,
     image_slots=("concept",),

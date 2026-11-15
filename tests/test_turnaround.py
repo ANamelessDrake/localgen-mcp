@@ -64,22 +64,10 @@ def test_front_from_concept_then_views_from_front_and_concept():
     for view in ("left", "back", "right"):
         assert _klein_refs(g, view) == [front, concept]
         assert "EmptyFlux2LatentImage" == _source(g, g[f"{view}_sample"]["inputs"]["latent_image"])["class_type"]
-    g = _graph(ref_order="concept_first")
-    assert _klein_refs(g, "left") == [concept, front]
     texts = {v: g[f"{v}_text"]["inputs"]["text"] for v in ("front", "left", "back", "right")}
     assert "front view" in texts["front"] and "No cast shadows".lower() in texts["front"].lower()
     assert "left side" in texts["left"] and "from directly behind" in texts["back"]
     assert all("a robot" in s for s in texts.values())
-
-
-def test_back_can_start_from_the_mirrored_front():
-    g = _graph(back_start="mirror", back_denoise=0.85)
-    sample = g["back_sample"]["inputs"]
-    init = _source(g, sample["latent_image"])
-    assert init["class_type"] == "VAEEncode" and init["inputs"]["pixels"] == ["back_flip", 0]
-    assert g["back_flip"]["inputs"] == {"image": ["front_decode", 0], "flip_method": "y-axis: horizontally"}
-    assert g["back_split"]["inputs"]["denoise"] == 0.85
-    assert "init" not in "".join(k for k in g if k.startswith("left_"))
 
 
 def test_symmetric_mirrors_the_right_views():
@@ -214,8 +202,7 @@ def test_classify_outputs():
     assert c["raw"] == {"left": paths[2]} and c["sheet"] == paths[3]
 
 
-@pytest.mark.parametrize("bad", [{"background": "grey"}, {"back_start": "flip"}, {"ref_order": "random"},
-                                 {"back_denoise": 0.2}, {"subject": "  "}])
+@pytest.mark.parametrize("bad", [{"background": "grey"}, {"background": "#12345"}, {"subject": "  "}])
 def test_bad_options_rejected(bad):
     with pytest.raises(ValueError):
         _graph(**bad)
