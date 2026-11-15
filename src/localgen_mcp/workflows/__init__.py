@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-_MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh", "part_isolate"]
+_MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh", "part_isolate",
+            "remove_background"]
 
 
 @dataclass(frozen=True)
