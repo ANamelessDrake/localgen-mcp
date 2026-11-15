@@ -12,15 +12,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 
 
 async def run(tool: str | None, args: dict, list_tools: bool) -> int:
-    params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"])
+    # The SDK passes the server only a minimal environment; forward PYTHONPATH (to test a checkout
+    # other than the one installed in the venv) and the LOCALGEN_* settings.
+    env = get_default_environment()
+    env.update({k: v for k, v in os.environ.items() if k == "PYTHONPATH" or k.startswith("LOCALGEN_")})
+    params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"], env=env)
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
