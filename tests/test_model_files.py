@@ -57,3 +57,18 @@ def test_garbage_is_not_a_model(tmp_path):
     p.write_text("password=hunter2")
     with pytest.raises(ModelFileError):
         require_self_contained(p)
+
+
+def test_renamed_glb_is_still_checked(tmp_path):
+    p = tmp_path / "innocent.bin"
+    p.write_bytes(_glb({"asset": ASSET, "buffers": [{"byteLength": 64, "uri": "/etc/hostname"}]}))
+    with pytest.raises(ModelFileError, match="external"):
+        require_self_contained(p)
+
+
+def test_retopology_wants_a_glb_name_and_content(tmp_path):
+    from localgen_mcp import retopo
+    p = tmp_path / "mesh.bin"
+    p.write_bytes(_glb({"asset": ASSET}))
+    with pytest.raises(retopo.RetopoError, match="binary glTF"):
+        retopo.validate(str(p), 10000, "quad", 2048)

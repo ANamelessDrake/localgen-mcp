@@ -30,7 +30,7 @@ def validate(input_mesh: str, target_faces: int, method: str, texture_size: int)
     path = Path(input_mesh).expanduser().resolve()
     if not path.is_file():
         raise RetopoError(f"mesh not found: {path}")
-    if not is_glb(path):
+    if path.suffix.lower() != ".glb" or not is_glb(path):
         raise RetopoError(f"not a binary glTF (.glb) file: {path}")
     try:
         model_files.require_self_contained(path)

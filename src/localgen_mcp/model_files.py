@@ -50,9 +50,17 @@ def external_references(path: Path) -> list[str]:
     return refs
 
 
+def is_gltf(path: Path) -> bool:
+    """glTF by name or by content (a binary glTF signature), so a renamed file is still caught."""
+    if path.suffix.lower() in (".glb", ".gltf"):
+        return True
+    with open(path, "rb") as f:
+        return f.read(4) == b"glTF"
+
+
 def require_self_contained(path: Path) -> None:
     """Raise unless a glTF/GLB embeds every buffer and image. Other formats are not checked here."""
-    if path.suffix.lower() in (".glb", ".gltf"):
+    if is_gltf(path):
         refs = external_references(path)
         if refs:
             raise ModelFileError(f"{path} references external files {refs[:5]}; "
