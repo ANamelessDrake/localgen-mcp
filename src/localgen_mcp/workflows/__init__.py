@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 _MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh", "part_isolate",
-            "upscale", "remove_background"]
+            "upscale", "remove_background", "turnaround"]
 
 
 @dataclass(frozen=True)
