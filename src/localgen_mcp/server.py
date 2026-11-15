@@ -26,7 +26,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, jobs, materials, model_files, retopo, workflows
+from . import backend, blender_run, config, cutout, jobs, materials, model_files, retopo, rig, speech, workflows
+from .workflows.image_edit import edit_images
 from .workflows.part_isolate import part_prompt
 
 
@@ -69,7 +70,8 @@ mcp = FastMCP(
         "paths (open them to view). The shared backend starts on the first call (about 10 s, plus model "
         "load) and stops itself after an idle timeout (default 300 s). Pass idle_timeout_seconds, or call "
         "start_backend first, when planning a long batch; call stop_backend when done to free GPU memory. "
-        "Only one large model fits in VRAM at a time; switching modality reloads models."
+        "Only one large model fits in VRAM at a time; switching modality reloads models. "
+        "speak (text to speech) runs on the CPU without the backend; list_voices shows its voices."
     ),
 )
 
@@ -96,6 +98,9 @@ async def generate_image(
     seed: int | None = None,
     steps: int | None = None,
     reference_images: list[str] | None = None,
+    input_image: str | None = None,
+    denoise: float | None = None,
+    mask_image: str | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
     model: str | None = None,
@@ -108,6 +113,22 @@ async def generate_image(
     with them (for example "change the jacket to red", "the person from image 1 in the setting of
     image 2"). This uses FLUX.2 Klein 4B; output size follows the first reference unless width and
     height are given.
+    input_image: a local image to start from (image to image) instead of noise. The output keeps
+    its size (width and height are not allowed); it is worked on at about 1 megapixel. The prompt
+    describes the whole desired result, not only the change.
+    denoise (0.05 to 1.0, needs input_image): how much may change. Z-Image Turbo default 0.6.
+    Z-Image holds on to the input strongly: 0.3 and 0.6 change only fine detail, 0.9 keeps the
+    layout but changes colours and materials, 1.0 ignores the input (except outside a mask).
+    mask_image (needs input_image): a black and white image, white = change, black = keep; any
+    size (it is stretched to input_image). Only the white area is regenerated, and the result is
+    pasted back over input_image with an 8 pixel feathered edge, so every pixel more than about
+    18 px outside the white area is exactly the original. To replace what is in the region use
+    denoise 1.0; to recolour an object, Klein (model="flux2-klein-4b") follows the prompt better
+    than Z-Image at 0.9, which keeps some of the old colour.
+    input_image with reference_images (or model="flux2-klein-4b"): FLUX.2 Klein edits input_image
+    as image 1 and the references are images 2 to 4 (at most 3), for example "give the person in
+    image 1 the hat from image 2"; Klein's denoise default is 1.0 (a full edit guided by image 1),
+    and mask_image limits it to a region the same way.
     count > 1 queues all images at once (one model load); seeds are seed, seed+1, ...
     Returns absolute PNG paths, the seeds and settings used, timings and the effective
     backend idle timeout. Default output folder: /ai/output/localgen/image/<date>/.
@@ -116,11 +137,12 @@ async def generate_image(
     if not 1 <= count <= 64:
         raise ValueError("count must be between 1 and 64")
     refs = [r for r in (reference_images or []) if r]
-    images = {f"ref{i + 1}": path for i, path in enumerate(refs)}
+    images = edit_images(input_image, mask_image, refs, denoise, width, height)
     wf = workflows.pick("image", model, set(images))
-    overrides = {"prompt": prompt, "width": width, "height": height, "steps": steps}
+    overrides = {"prompt": prompt, "width": width, "height": height, "steps": steps, "denoise": denoise}
     job_list = [dict(overrides, seed=None if seed is None else seed + i) for i in range(count)]
-    logger.info("generate_image: %d x %r refs=%d (%s)", count, prompt[:80], len(refs), wf.name)
+    logger.info("generate_image: %d x %r refs=%d image=%s mask=%s (%s)", count, prompt[:80], len(refs),
+                input_image, mask_image, wf.name)
     return await jobs.run_workflow(settings, wf, job_list, output_dir, idle_timeout_seconds,
                                    images=images, timeout=TIMEOUTS["image"], progress=_progress(ctx))
 
@@ -275,6 +297,54 @@ async def retopologize_mesh(
                                      detail, detail_strength, lods)
 
 
+@mcp.tool()
+async def rig_creature(
+    input_mesh: str,
+    preset: str = "auto",
+    bones: int | None = None,
+    axis: str | list[float] | None = None,
+    root_end: str | list[float] | None = None,
+    wing_chains: int = 3,
+    wing_bones: int = 4,
+    weights: str = "auto",
+    name: str | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    """Soft rig for an organic creature (tentacles, tails, vines, rays, fish): bone chains with smooth skin
+    weights, so engine scripts or physics (Verlet, springs) can bend it. No animation clips are made.
+
+    Call it on a clean mesh: run retopologize_mesh first (generated meshes are about 300k faces with
+    stray shells; a quad retopology of 5k to 20k faces skins and deforms far better). input_mesh: a GLB.
+    preset:
+      "chain": one chain of `bones` (default 8) along the mesh's main axis, or `axis`; for tentacles,
+        tails, vines. Bones are named <name>_01.. from the root (name default "tentacle").
+      "spine": the same along the body, named spine_01.. (default 6 bones).
+      "wings": stingray, manta, bat or bird: a spine along the body length (`bones`, default 6) and,
+        on each side, `wing_chains` (default 3) chains of `wing_bones` (default 4) fanning from the body
+        to the wing edge. Named spine_01.., wing_L1_01.. and the mirrored wing_R1_01.. (L is the
+        positive side of the left-right axis: +X when that is X, the creature's left when it faces -Y as
+        generated meshes do; chain 1 is nearest the head).
+      "auto" (default): chain if long and thin, wings if flat and broad, else spine; the report says
+        which and why.
+    axis: "x", "y", "z" or [x, y, z]: the chain direction, or the body length for "wings"
+    (default: from the mesh's principal axes; for wings, the left-right axis is the one the mesh is
+    mirror symmetric across).
+    root_end: which end the chain (or the spine, at the head) starts from: "min" or "max" along the
+    axis, or a point [x, y, z] (the end nearest it). Default: a vertical chain starts at its lower end,
+    otherwise at the thicker end (a tentacle's base); wings start at the wider end (a tail is narrow).
+    weights: "auto" tries Blender's heat weights and falls back to a smooth distance falloff from the
+    bones when they fail (more than 1% of the vertices unweighted or on a far bone, common on generated
+    meshes); "distance" always uses the falloff. Every vertex gets at most 4 influences, normalised.
+    Bone axes: local Y runs along each bone; rotate about local X to bend (for wings, local Z is the
+    surface normal, so local X rotation flaps up and down).
+    Output: <output_dir or the input's folder>/<input name>_rig_<preset>.glb and .fbx (armature and skinned
+    mesh, rest pose). Returns the bones (head, tail, parent), the preset used, weight coverage and
+    method, and warnings. Headless Blender on the CPU, a few seconds.
+    """
+    return await rig.rig_creature(settings, input_mesh, preset, bones, axis, root_end, wing_chains, wing_bones,
+                                  weights, name, output_dir)
+
+
 def _reuse_file(root: Path, entry, kind: str) -> str | None:
     """A file recorded in a parts state file, only if it is a relative path inside root and still passes
     the checks a fresh input would. The state file sits in a caller-chosen folder, so it is not trusted."""
@@ -319,6 +389,143 @@ def _part_boxes(parts: list[dict], width: int, height: int) -> list[dict]:
         out.append({"name": name, "box": [x0, y0, x1, y1], "parent": p.get("parent"),
                     "description": str(p.get("description") or "")})
     return out
+
+
+@mcp.tool()
+async def generate_turnaround(
+    concept_image: str | None = None,
+    prompt: str | None = None,
+    subject: str | None = None,
+    three_quarter: bool = False,
+    symmetric: bool = False,
+    background: str = "#d8d8d8",
+    mesh: bool = False,
+    view_size: int | None = None,
+    steps: int | None = None,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Make consistent turnaround views of one object (front, left, back, right) from a concept image.
+
+    Give concept_image (a local PNG or JPEG of the object, any angle), or only prompt to generate the
+    concept first with the image model. subject: a few words naming the object and its key parts
+    ("a salvage robot with a cargo cage on its back and tread feet"); it goes into every view's prompt
+    and defaults to prompt. Naming the parts helps them appear in every view.
+    FLUX.2 Klein first redraws the concept as a clean front view (flat even lighting, no cast shadows,
+    plain background), then draws each other view from that front and the concept. Views follow
+    Pixal3D's rig: the left view shows the object's own left side, facing image-left.
+    three_quarter=True adds front_left, back_left, back_right and front_right views (for reference;
+    meshing uses the four main views). symmetric=True draws only the left-hand views and mirrors them
+    into the right-hand ones, which keeps a left-right symmetric object consistent (do not use it for
+    asymmetric objects).
+    Every view is framed for Pixal3D: square, the object centred, the same scale in every view (each
+    view is scaled to the same silhouette height, which assumes a standing object seen level), the
+    widest view at 1/1.1 of the frame. Views are RGBA PNGs (alpha is the foreground) on `background`;
+    a sheet puts them side by side.
+    mesh=True also meshes the four views with generate_mesh's multi-view path (framing "as_framed").
+    Views are generated, so they can still disagree on details: look at them before relying on them.
+    Returns the view paths by name, the raw (unframed) views, the sheet, the concept, and the mesh
+    result when asked. About 6 s per view warm, plus model loads.
+    """
+    from .workflows import turnaround
+
+    if not concept_image and not prompt:
+        raise ValueError("give concept_image or prompt")
+    wf = workflows.get("turnaround")
+    overrides = {"subject": (subject or prompt or "the object").strip().rstrip("."), "three_quarter": three_quarter,
+                 "symmetric": symmetric, "background": background, "view_size": view_size, "steps": steps,
+                 "seed": seed}
+    turnaround.check(wf.params(overrides))  # fail on bad options before any GPU work
+    concept = None
+    if concept_image:
+        path = Path(concept_image).expanduser().resolve()
+        if not path.is_file() or not jobs.is_image_file(path):
+            raise ValueError(f"concept_image must be a PNG or JPEG image: {path}")
+        concept = str(path)
+    progress = _progress(ctx)
+    reference = None
+    if concept is None:
+        reference = await generate_image(prompt + turnaround.CONCEPT_SUFFIX, seed=seed, output_dir=output_dir,
+                                         idle_timeout_seconds=idle_timeout_seconds, ctx=ctx)
+        concept = reference["paths"][0]
+    logger.info("generate_turnaround: %s (%s)", concept, wf.name)
+    result = await jobs.run_workflow(settings, wf, [overrides], output_dir, idle_timeout_seconds,
+                                     images={"concept": concept}, timeout=TIMEOUTS["image"], progress=progress)
+    result.update(turnaround.classify(result["paths"]))
+    result["concept_image"] = concept
+    if reference is not None:
+        result["concept_seconds"] = reference["total_seconds"]
+    if mesh:
+        v = result["views"]
+        result["mesh"] = await generate_mesh(input_image=v["front"], left_image=v.get("left"),
+                                             back_image=v.get("back"), right_image=v.get("right"),
+                                             framing="as_framed", remove_background=False, seed=seed,
+                                             output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds,
+                                             ctx=ctx)
+    return result
+
+
+@mcp.tool()
+async def generate_material(
+    prompt: str,
+    size: int = 1024,
+    reference_image: str | None = None,
+    tile_image: str | None = None,
+    name: str | None = None,
+    normal_strength: float = 1.0,
+    directx_normal: bool = False,
+    invert_height: bool = False,
+    roughness: float = 0.7,
+    roughness_variation: float = 0.25,
+    ao_strength: float = 0.6,
+    seam_passes: int = 2,
+    seam_denoise: float = 0.7,
+    seam_width: float = 0.25,
+    preview: str = "sphere",
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Make a tileable (seamless) PBR surface material for environment art: rock, rusted metal, floors.
+
+    prompt describes the surface only ("rough grey basalt rock with cracks"); "seamless top-down texture"
+    wording is added. size 1024 (default) or 2048 (512 to 2048, a multiple of 64). reference_image: a
+    picture whose colours and material to follow (FLUX.2 Klein). tile_image: make this existing image
+    tileable instead of generating one (the prompt still guides the seam repaint).
+    How it tiles: the image is offset by half its size with wrap around, then the cross where the old
+    edges meet is repainted image to image under a soft, ragged mask (Z-Image Turbo) and only the
+    masked part composited back; the arms stop short of the edges and the leftover spots are
+    repainted after a further quarter offset, so no repaint ever crosses an edge and the result
+    wraps exactly. seam_width (0.05 to 0.3 of the size, default 0.25) is how wide the band is;
+    seam_denoise (0.3 to 1.0, default 0.7) how freely it is repainted: higher hides a stubborn seam
+    but drifts from the surrounding texture. The wrap and the repainted centre are then measured;
+    while the centre still shows a line, the repaint runs again (seam_passes in all, default 2; a
+    rerun is kept only if it helps).
+    Maps, derived from the base color in Blender on the CPU, all tiling: height (16 bit; luminance,
+    high pass, light blur; brighter is higher, invert_height=True for the reverse), normal (tangent
+    space, OpenGL +Y green up as Unity and Blender expect; directx_normal=True writes DirectX -Y for
+    Unreal; normal_strength 0 to 10), roughness (roughness 0 to 1 is the base, 0.2 glossy, 0.8 matte;
+    rougher in cavities and dark spots by up to roughness_variation), ambient occlusion from the
+    height's cavities (ao_strength 0 to 1).
+    Previews: a 3x3 tiling of the base color, and a lit Cycles render (preview "sphere", "plane" or
+    "none") using every map. Look at both to judge seams and relief.
+    Output: <output_dir or /ai/output/localgen/material/<date>>/<name>_<seed>/ with <stem>_basecolor.png,
+    _height.png, _normal_gl.png (or _normal_dx.png), _roughness.png, _ao.png, _tile3x3.png,
+    _preview.png. Returns the paths, seed, the normal convention, and seam metrics per map ("tiles"
+    is true when every wrap edge is within the image's own neighbouring pixel differences).
+    About 25 s on the GPU at 1024 when warm (longer at 2048, and again for each extra seam pass),
+    plus 5 to 15 s in Blender on the CPU.
+    """
+    logger.info("generate_material: %r size=%d", prompt[:80], size)
+    return await materials.generate(
+        settings, prompt, size=size, reference_image=reference_image, tile_image=tile_image, name=name,
+        normal_strength=normal_strength, directx_normal=directx_normal, invert_height=invert_height,
+        roughness=roughness, roughness_variation=roughness_variation, ao_strength=ao_strength,
+        seam_passes=seam_passes, seam_denoise=seam_denoise, seam_width=seam_width, preview=preview, seed=seed,
+        output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx))
 
 
 @mcp.tool()
@@ -530,64 +737,156 @@ async def _texture(clean, src, prompt, style_image, views, texture_size, denoise
 
 
 @mcp.tool()
-async def generate_material(
-    prompt: str,
-    size: int = 1024,
-    reference_image: str | None = None,
-    tile_image: str | None = None,
-    name: str | None = None,
-    normal_strength: float = 1.0,
-    directx_normal: bool = False,
-    invert_height: bool = False,
-    roughness: float = 0.7,
-    roughness_variation: float = 0.25,
-    ao_strength: float = 0.6,
-    seam_passes: int = 2,
-    seam_denoise: float = 0.7,
-    seam_width: float = 0.25,
-    preview: str = "sphere",
-    seed: int | None = None,
+async def remove_background(
+    images: list[str],
+    trim: bool = False,
+    padding: float = 0.05,
+    square: bool = False,
+    size: int | None = None,
+    background: str | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Make a tileable (seamless) PBR surface material for environment art: rock, rusted metal, floors.
+    """Cut the subject out of one or more images: PNG cut-outs with a transparent background (BiRefNet).
 
-    prompt describes the surface only ("rough grey basalt rock with cracks"); "seamless top-down texture"
-    wording is added. size 1024 (default) or 2048 (512 to 2048, a multiple of 64). reference_image: a
-    picture whose colours and material to follow (FLUX.2 Klein). tile_image: make this existing image
-    tileable instead of generating one (the prompt still guides the seam repaint).
-    How it tiles: the image is offset by half its size with wrap around, then the cross where the old
-    edges meet is repainted image to image under a soft, ragged mask (Z-Image Turbo) and only the
-    masked part composited back; the arms stop short of the edges and the leftover spots are
-    repainted after a further quarter offset, so no repaint ever crosses an edge and the result
-    wraps exactly. seam_width (0.05 to 0.3 of the size, default 0.25) is how wide the band is;
-    seam_denoise (0.3 to 1.0, default 0.7) how freely it is repainted: higher hides a stubborn seam
-    but drifts from the surrounding texture. The wrap and the repainted centre are then measured;
-    while the centre still shows a line, the repaint runs again (seam_passes in all, default 2; a
-    rerun is kept only if it helps).
-    Maps, derived from the base color in Blender on the CPU, all tiling: height (16 bit; luminance,
-    high pass, light blur; brighter is higher, invert_height=True for the reverse), normal (tangent
-    space, OpenGL +Y green up as Unity and Blender expect; directx_normal=True writes DirectX -Y for
-    Unreal; normal_strength 0 to 10), roughness (roughness 0 to 1 is the base, 0.2 glossy, 0.8 matte;
-    rougher in cavities and dark spots by up to roughness_variation), ambient occlusion from the
-    height's cavities (ao_strength 0 to 1).
-    Previews: a 3x3 tiling of the base color, and a lit Cycles render (preview "sphere", "plane" or
-    "none") using every map. Look at both to judge seams and relief.
-    Output: <output_dir or /ai/output/localgen/material/<date>>/<name>_<seed>/ with <stem>_basecolor.png,
-    _height.png, _normal_gl.png (or _normal_dx.png), _roughness.png, _ao.png, _tile3x3.png,
-    _preview.png. Returns the paths, seed, the normal convention, and seam metrics per map ("tiles"
-    is true when every wrap edge is within the image's own neighbouring pixel differences).
-    About 25 s on the GPU at 1024 when warm (longer at 2048, and again for each extra seam pass),
-    plus 5 to 15 s in Blender on the CPU.
+    images: 1 to 64 local image paths (PNG, JPEG, WebP, GIF, BMP or TIFF; the first frame of an
+    animation). All are processed in one batch, so the model loads once; pass them together.
+    With no other option each output is the same size as its input, the subject opaque and the
+    background transparent, so it lines up with the original for compositing.
+    trim=True crops to the subject's bounding box, plus padding on every side (a fraction of the
+    subject's longer side, default 0.05; 0 is a tight crop). padding applies only with trim.
+    square=True centres the result on a square transparent canvas (for icons and sprites).
+    size: scale so the longer side is this many pixels (16 to 4096); with square, size x size.
+    background: a colour like "#ffffff" to flatten onto instead of transparency (RGB PNG).
+    Typical calls: UI icon trim=True, square=True, size=256; item sprite trim=True, padding=0;
+    cut-out for compositing: no options.
+    Returns per image the input, the output path, its size and the subject box found (x0, y0, x1,
+    y1 in input pixels, with trim). A second, model free pass does the layout when any option is
+    set. Default output folder: /ai/output/localgen/cutout/<date>/.
     """
-    logger.info("generate_material: %r size=%d", prompt[:80], size)
-    return await materials.generate(
-        settings, prompt, size=size, reference_image=reference_image, tile_image=tile_image, name=name,
-        normal_strength=normal_strength, directx_normal=directx_normal, invert_height=invert_height,
-        roughness=roughness, roughness_variation=roughness_variation, ao_strength=ao_strength,
-        seam_passes=seam_passes, seam_denoise=seam_denoise, seam_width=seam_width, preview=preview, seed=seed,
-        output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx))
+    logger.info("remove_background: %d image(s) trim=%s square=%s size=%s", len(images or []), trim, square, size)
+    return await cutout.remove_background(settings, images, trim, padding, square, size, background, output_dir,
+                                          idle_timeout_seconds, TIMEOUTS["image"], _progress(ctx))
+
+
+# -- speech ---------------------------------------------------------------
+
+
+@mcp.tool()
+async def speak(
+    text: str,
+    voice: str | None = None,
+    speed: float = 1.0,
+    effect: str = "none",
+    intensity: float = 0.5,
+    seed: int | None = None,
+    name: str | None = None,
+    output_dir: str | None = None,
+    keep_dry: bool = True,
+) -> dict:
+    """Speak a line of text (English) to a WAV file, with an optional game voice effect. Runs on the CPU.
+
+    Model: Kokoro-82M (Apache 2.0) in its own venv, offline; ComfyUI and the GPU are not used, so it
+    never waits on image or video jobs. About 10 s to load plus about 1 s per sentence.
+    voice: an installed voice name (see list_voices; default "af_heart"), or a comma separated blend
+    of up to 4 voices with the same accent, averaged ("am_michael,bm_george" is invalid: two accents;
+    "am_michael,am_fenrir" is fine). Prefix a = American, b = British; f = female, m = male.
+    speed: 0.5 to 2.0 (1.0 normal).
+    effect: "none"; "radio" (band limited, compressed, light hiss, like a comms channel); "robotic"
+    (flat buzzing monotone with a metallic echo); "glitch" (a voice struggling on low power: stutters
+    on word onsets, dropouts, bursts of bit crushing). intensity 0 to 1 (default 0.5) scales the effect.
+    seed makes the glitch pattern and noise reproducible (returned in the result either way).
+    name: file name stem for the line (for example "pathfinder_hull_40_lowpower"); an existing file
+    with that name is overwritten. Default: <voice>_<effect>_<random>.
+    keep_dry: with an effect, also keep the unprocessed take as <name>_dry.wav.
+    Output: 24 kHz mono 16 bit WAV, plus an OGG Vorbis copy when ffmpeg is installed, in output_dir
+    (default /ai/output/localgen/audio/<date>/). Returns the paths, duration, sample rate, RMS and peak
+    level, word timings and the seed. Text up to 2000 characters; one call per line of dialogue.
+    """
+    logger.info("speak: %r voice=%s effect=%s", text[:80], voice, effect)
+    return await speech.speak(settings, text, voice, speed, effect, output_dir, intensity, seed, name, keep_dry)
+
+
+@mcp.tool()
+async def list_voices() -> dict:
+    """Text to speech voices installed for speak(): name, accent, gender and Kokoro's quality grade
+    (A best, F worst; higher grades had more and cleaner training audio), the effects available,
+    and whether ffmpeg (for effects and OGG output) was found."""
+    return await asyncio.to_thread(speech.voices_report, settings)
+
+# -- upscaling ------------------------------------------------------------
+
+UPSCALE_MAX_SIDE = 8192  # longest side of the result, in pixels
+
+
+def _upscale_input(input_image: str, scale: int) -> tuple[Path, int, int, bool]:
+    """Validate an upscale input; returns its path, size and whether it is a PNG with alpha."""
+    if scale not in (2, 4):
+        raise ValueError("scale must be 2 or 4")
+    src = Path(input_image).expanduser().resolve()
+    if not src.is_file():
+        raise ValueError(f"input image not found: {src}")
+    if not jobs.is_image_file(src):  # checked by content: only real images are uploaded
+        raise ValueError(f"not an image file: {src}")
+    try:
+        width, height = jobs.image_size(src)
+    except jobs.JobError:
+        raise ValueError(f"input_image must be a PNG or JPEG: {src}") from None
+    if min(width, height) < 16:
+        raise ValueError(f"input image is {width}x{height}; it must be at least 16 px on each side")
+    if max(width, height) * scale > UPSCALE_MAX_SIDE:
+        raise ValueError(f"{width}x{height} at {scale}x would be {width * scale}x{height * scale}; the result "
+                         f"is limited to {UPSCALE_MAX_SIDE} px per side (use scale 2, or crop the image first)")
+    return src, width, height, jobs.png_has_alpha(src)
+
+
+@mcp.tool()
+async def upscale_image(
+    input_image: str,
+    scale: int = 4,
+    model: str | None = None,
+    keep_alpha: bool = True,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Upscale an image (PNG or JPEG) 2x or 4x with a super resolution model, adding plausible detail.
+
+    model: "realesrgan-x4plus" (default; general purpose, suits concept art, renders and photos, and
+    cleans up mild noise and JPEG artefacts) or "pbrify-v4" (made for game textures such as albedo,
+    roughness or normal maps; keeps fine surface detail; about 3 times slower).
+    scale: 4 (the models' native scale) or 2 (the 4x result downscaled by half with Lanczos).
+    keep_alpha: a PNG with transparency keeps it; the alpha channel is upscaled smoothly, the colour
+    by the model. keep_alpha=False writes an opaque RGB PNG.
+    Large images are processed in tiles inside the backend, so any size fits in VRAM; the result is
+    limited to 8192 px per side (for example 2048 px at 4x, 4096 px at 2x) and is an 8-bit PNG.
+    Measured on this GPU: about 0.5 s per megapixel of 4x output with the default model and 1.5 s
+    with pbrify-v4 (a 1024 px image takes about 9 s and 25 s), plus any wait for the shared queue.
+    Output: <output_dir or /ai/output/localgen/upscale/<date>>/<input name>_x<scale>.png.
+    Returns the path, input and output sizes, whether alpha was kept, and timings.
+    """
+    src, width, height, alpha = await asyncio.to_thread(_upscale_input, input_image, scale)
+    wf = workflows.pick("upscale", model, {"image"})
+    keep = keep_alpha and alpha
+    logger.info("upscale_image: %s %dx%d x%d alpha=%s (%s)", src, width, height, scale, keep, wf.name)
+    result = await jobs.run_workflow(settings, wf, [{"scale": scale, "alpha": keep}], output_dir,
+                                     idle_timeout_seconds, images={"image": str(src)},
+                                     timeout=TIMEOUTS["image"], progress=_progress(ctx))
+    out = Path(result["paths"][0])
+    final = out.with_name(f"{src.stem}_x{scale}.png")
+    n = 1
+    while final.exists():
+        n += 1
+        final = out.with_name(f"{src.stem}_x{scale}_{n}.png")
+    out.rename(final)
+    result["paths"] = [str(final)]
+    result["outputs"][0]["paths"] = [str(final)]
+    result["upscaled_image"] = str(final)
+    result["input_size"] = [width, height]
+    result["output_size"] = [width * scale, height * scale]
+    result["alpha_kept"] = keep
+    return result
 
 
 # -- backend control ------------------------------------------------------

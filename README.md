@@ -11,18 +11,36 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 
 | Tool | What it does |
 |---|---|
-| `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). `count` queues several at once with one model load. |
+| `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). With `input_image` and `denoise`, image to image; `mask_image` limits the change to a region and leaves the rest byte for byte (below). `count` queues several at once with one model load. |
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). `lods` adds a LOD chain sharing one texture set. Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces` or `retopo_lods`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
 | `generate_material` | Tileable PBR surface material from a prompt (optional `reference_image`, or `tile_image` to make an existing picture tile): a seamless base color plus height, normal (OpenGL +Y, or DirectX), roughness and AO maps, a 3x3 tile preview and a lit Cycles render. 1024 or 2048 px; about 25 s warm at 1024 plus 5 to 15 s in Blender. |
+| `generate_turnaround` | Consistent front, left, back and right views (optionally three-quarter views too) of one object from a concept image or a prompt: flat lit, plain background, framed at one scale for Pixal3D's rig, plus a sheet. `mesh=True` meshes them through `generate_mesh`'s multi-view path. |
+| `remove_background` | Cut the subject out of 1 to 64 images in one batch (BiRefNet): RGBA PNGs with a transparent background. Optional `trim` to the subject with `padding`, `square` canvas, output `size`, or a solid `background` colour. For UI icons, item sprites and compositing. |
+| `speak` | Text to speech for game dialogue (Kokoro-82M, English, on the CPU): 24 kHz WAV plus OGG, in one of 28 voices or a blend, with an optional `effect` (`radio`, `robotic`, `glitch` for a voice struggling on low power). Needs `install.sh --with-tts`. |
+| `list_voices` | The installed voices (accent, gender, quality grade), the effects, and whether ffmpeg was found. |
+| `rig_creature` | Soft rig for an organic creature: bone chains (`chain` for tentacles, tails and vines; `spine`; `wings` for rays and other flat flyers; `auto` picks) with smooth skin weights, at most 4 per vertex, so engine scripts or physics can bend it. Writes a GLB and an FBX. Headless Blender on the CPU, a few seconds. |
+| `upscale_image` | Upscale a PNG or JPEG 2x or 4x with a super resolution model: Real-ESRGAN x4plus for concept art and general images, or 4x-PBRify V4 (`model="pbrify-v4"`) for game textures. Keeps transparency. A few seconds to a minute. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
 
 Every generation tool takes optional `output_dir`, `seed`, `model` and `idle_timeout_seconds`. Outputs default to `/ai/output/localgen/<modality>/<date>/`. Long jobs send MCP progress notifications.
+
+### Image to image and masked editing
+
+`generate_image(input_image=..., denoise=..., mask_image=...)` starts from an image instead of noise.
+- **Image to image:** the input is VAE encoded and sampled with partial `denoise` (0.05 to 1.0, default 0.6 for Z-Image Turbo). Z-Image holds on to the input strongly: at 0.3 and 0.6 only fine detail changes, at 0.9 the layout stays and colours and materials change, and 1.0 ignores the input. The prompt describes the whole result.
+- **Denoise with few steps:** KSampler runs `steps` steps of an `int(steps / denoise)` step schedule, so at Z-Image's 8 steps any denoise from 0.89 up would be a full schedule from pure noise (measured: 0.9 gave an unrelated image). The graph picks 8 to 16 steps so the applied value is within 0.01 of the request up to 0.9; above that it is at most 0.94 (16 of 17 steps), so below 1 the input always counts. Klein's custom sampler gets the same treatment.
+- **Size:** any input size works. It is worked on at about 1 megapixel with both sides a multiple of 16 and resized back, so the output has the input's size; `width` and `height` are refused with `input_image`.
+- **Mask:** a black and white image, white = change, black = keep, read from its red channel and stretched to the input if its size differs. Sampling is limited to the mask (`SetLatentNoiseMask`), then the result is pasted over the original (`ImageCompositeMasked`) with the mask grown and feathered by 8 pixels. Every pixel more than about 18 px outside the white area is the original's, byte for byte (measured below). To replace what is in the region use `denoise` 1.0; to recolour an object, Klein follows the prompt better than Z-Image, which at 0.9 keeps some of the old colour.
+- **With `reference_images`** (or `model="flux2-klein-4b"`): FLUX.2 Klein edits `input_image` as image 1, with the references as images 2 to 4 (so at most 3). It starts from the input's latent too, with `denoise` default 1.0, which is Klein's usual reference guided edit; `mask_image` limits it the same way.
+- Refused combinations: `mask_image` or `denoise` without `input_image`, and `width` or `height` with it.
+- Measured through the MCP server on a 1024x1024 image (Z-Image at 0.9, and Klein) and a 1001x757 one with a 433x311 mask (Z-Image at 1.0): no pixel more than 18 px outside the mask changed; from 16 to 18 px at most by one level; from 8 to 16 px by at most 8 (34 for Klein). Without the composite step, 99% of the pixels outside the mask changed by up to 22 levels (the VAE round trip).
+- The input's alpha channel is dropped (the output is RGB). Like every input image, the mask is uploaded only after a content check.
 
 ### Multi-view framing
 
@@ -99,6 +117,64 @@ Limits: every view is painted separately, so the views can disagree on details. 
 
 Limits: the maps are derived from the colour, so relief follows brightness, not real geometry: painted dark stains read as dents. The roughness is a heuristic, and there is no metallic map. The repaint can soften or change detail inside the band, which can show as a faint softer strip through the middle when tiled; look at the 3x3 preview. The seam metric is conservative for grids: on panel plating the wrap edge falls on a panel line, which can be the strongest transition in the image and then reads as not ok although it is not a seam.
 
+### Turnarounds
+
+`generate_turnaround` makes the views a multi-view mesh needs from one concept image (or from a prompt, generating the concept first).
+- **Views:** FLUX.2 Klein redraws the concept as a clean front view, then draws left, back and right (and with `three_quarter=True` the four diagonals) from references [clean front, concept]. Every prompt asks for flat even lighting, no cast shadows and a plain background, and names which way the object faces: the left view shows the object's own left side, facing image-left, as in Pixal3D's rig. `subject` names the object and its parts; parts named there turn up in more views.
+- **Framing:** each view gets a BiRefNet mask and is scaled so its silhouette has the same height as in every other view, then all views are cropped by one square box around the union of their silhouettes. So every view has one scale, the object is centred, and the widest view spans 1/1.1 of the frame, as the rig wants. This assumes the object's height is the same from every side, which holds for a standing object seen level. The views are RGBA PNGs (alpha is the mask), plus a sheet of them side by side.
+- **Meshing:** `mesh=True` feeds the four main views to `generate_mesh` with `framing="as_framed"` and the views' own alpha.
+- **Limits:** the views are drawn separately, so small asymmetric parts can drift between them. On the test robot, with a generic `subject`, its one antenna came out doubled in the back view, or on the wrong side, depending on the seed; large parts (head, cargo cage, arms, treads) stayed consistent. Naming the part and its side in `subject` ("exactly one antenna, behind the right side of its head (its own right)") gave one antenna, on the right side, in every view. Starting the back view from the mirrored front did not help (at denoise 0.7 the back kept the face). `symmetric=True` mirrors the left-hand views into the right-hand ones, which keeps left and right consistent for symmetric objects only. Look at the views before meshing.
+
+### Background removal
+
+`remove_background` takes a list of images and returns one PNG per image, the subject opaque and the background transparent.
+- **No options:** each cut-out is the size of its input and lines up with it, ready for compositing.
+- **`trim=True`:** crops to the subject's bounding box, plus `padding` on every side as a fraction of the subject's longer side (default 0.05; 0 for a tight crop). The result reports the box found, in input pixels.
+- **`square=True`:** centres the result on a square transparent canvas. **`size`:** scales the longer side to that many pixels (with `square`, size x size). **`background="#rrggbb"`:** flattens onto a solid colour instead (RGB PNG).
+- Typical calls: a UI icon is `trim=True, square=True, size=256`; an item sprite is `trim=True, padding=0`.
+- **How:** one ComfyUI prompt holds a chain per image, so BiRefNet loads once for the batch: `RemoveBackground` gives the foreground mask, and `JoinImageWithAlpha` gets `InvertMask` of it, because it inverts its alpha input (it expects LoadImage's 1 - alpha convention). With any option set, a second prompt without a model crops, pads, scales and flattens each cut-out using native nodes (`ImageCrop`, `ImageCompositeMasked`, `ImageScale` with Lanczos). No native node returns a bounding box as numbers, so pass 1 also saves a 512 px copy of the mask and the server reads the box from it with the standard library, rounding outwards.
+- **Limits:** the edge colour is the original pixel colour, so semi-transparent edges (hair, fur) keep a trace of the old background; a plain background that contrasts with the subject gives the cleanest result. Mask values under about 5% count as background when finding the box. Only the first frame of an animated GIF or WebP is used. BiRefNet's mask tops out just under 1, so the subject's alpha is 253 or 254 rather than 255. With layout options the job is two prompts, and on a busy shared backend each waits its turn in the queue.
+
+### Speech
+
+`speak` turns one line of English into a WAV file for game dialogue. It does not use ComfyUI or the GPU, so it runs beside image and video jobs.
+- **Model:** Kokoro-82M v1.0 (Apache 2.0) on the CPU, in its own venv (`<root>/venvs/localgen-tts`). The MCP server runs `src/localgen_mcp/tts/runner.py` with that venv's Python and reads its final `TTS_RESULT {json}` line, the same pattern as the Blender scripts. The runner gets `HF_HUB_OFFLINE=1` and a CPU only PyTorch build.
+- **Time:** about 5 s per line on 4 threads, most of it loading the model; each call starts a fresh process, so nothing stays in memory.
+- **Voices:** 20 American and 8 British English voices; `list_voices` gives Kokoro's quality grade for each (`af_heart` A, `af_bella` A-, `bf_emma` and `af_nicole` B-, the male voices C+ at best). A comma separated list of up to 4 voices with one accent is averaged into a new voice.
+- **Effects** (ffmpeg filter graphs in `tts/effects.py`; `intensity` 0 to 1 scales each):
+  - `radio`: band limited to about 300 to 3200 Hz, compressed, light crushing and hiss.
+  - `robotic`: a constant phase spectrum (a flat, buzzing monotone) with a short metallic echo.
+  - `glitch`: for the low power lines. Stutters repeat the onset of some words (placed with the model's word timings), with dropouts, bursts of heavy bit crushing and light crushing throughout. `seed` reproduces a take.
+  - The effected take is brought back to the dry take's peak level, and the dry take is kept as `<name>_dry.wav`.
+  - Without ffmpeg, the runner renders approximations with numpy and writes WAV only.
+- **Output:** 24 kHz mono 16 bit WAV and an OGG Vorbis copy, named by `name` (for example `pathfinder_hull_40_lowpower`). The result gives the duration, sample rate, RMS and peak level, and word timings (usable for subtitles).
+- **Limits:** English only. Very short lines (a word or two) are weaker; Kokoro's model card suggests bundling them. No voice cloning; see [docs/model-choices.md](docs/model-choices.md) for why Chatterbox was not chosen. Levels and durations are checked automatically; only a listener can judge the voice itself.
+
+### Soft rigs for creatures
+
+`rig_creature` rigs organic meshes for deformation driven in the engine (shaders, Verlet chains, springs); it makes no animation clips. Run it on a `retopologize_mesh` result: raw generated meshes are heavy and full of stray shells.
+- **Presets.**
+  - `chain`: `bones` (default 8) along the main axis or a given `axis`, rooted at `root_end` (default: the lower end of a vertical chain, else the thicker end). Joints are slice centroids, so the chain follows a gently curved mesh.
+  - `spine`: the same along a body.
+  - `wings`: the thin axis is the surface normal, and the left-right axis is the one the mesh is mirror symmetric across. A spine runs down the middle, and `wing_chains` chains of `wing_bones` bones fan out on each side to the wing edge.
+  - `auto`: picks from the proportions and reports why.
+- **Names.** `tentacle_01` (or `<name>_01`), `spine_01`, `wing_L1_01` and the mirrored `wing_R1_01`, numbered from the root and, for wing chains, from the head. Every bone's local Y runs along it; rotating about local X bends it (for wings, towards the surface normal: a flap).
+- **Weights.** Blender's heat weights first. They often fail on generated meshes: on the test manta, a spine rig left 100% of the vertices unweighted ("failed to find solution"). When more than 1% of the vertices are unweighted, or weighted mainly to a bone more than twice as far as their nearest, all weights are replaced by a smooth inverse distance falloff from the bone segments; a smaller share is patched. Vertices at the same position (split at UV seams) get the same weights, then each vertex keeps its 4 largest, normalised. The report gives the method, the heat failure shares, coverage and influences per vertex.
+- **Output.** A GLB and an FBX in the rest pose, and a report of every bone (head, tail, parent).
+- `scripts/render_glb_views.py ... --pose 'wing_.*=12'` renders a rig posed, framed like the rest pose, for before and after stills.
+- **Limits.**
+  - Joints come from straight slices, so a tentacle curled through more than about 90 degrees gets a chain that cuts the curve. Give it a straighter mesh or split it.
+  - Distance weights are Euclidean, so parts that touch without being connected (a tentacle curled against the body) pull on each other.
+  - On `wings`, the body is a fixed strip (12% of the half span each side of the middle). Anything outside it, such as a manta's head lobes, moves with the nearest wing chain.
+
+### Upscaling
+
+`upscale_image` runs a 4x super resolution model with ComfyUI's native `UpscaleModelLoader` and `ImageUpscaleWithModel` nodes.
+- **Models:** `realesrgan-x4plus` (default) is a general upscaler that also cleans up mild noise and JPEG artefacts; it suits concept art, renders and photos. `pbrify-v4` is trained on game textures and keeps more fine surface detail, at about 3 times the run time. Both allow commercial use (BSD-3-Clause and CC0); see [docs/model-choices.md](docs/model-choices.md#upscaling-added-2026-11-15).
+- **Scale:** 4 is the models' native scale. 2 downscales the 4x result by half with Lanczos, so one model serves both scales.
+- **Alpha:** a PNG with transparency keeps it (`keep_alpha=false` drops it). The model upscales the colour, and the alpha channel is resized bilinearly. Colour hidden under fully transparent pixels is upscaled too, so edges look as clean as the source's.
+- **Large images:** the upscale node works in 512 px tiles (halved if the GPU runs out of memory), so VRAM is not the limit. The result is limited to 8192 px per side: 2048 px inputs at 4x, 4096 px at 2x. Output is an 8-bit PNG named `<input>_x<scale>.png`.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -117,6 +193,9 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 | Video | Wan 2.2 TI2V 5B fp16 | Apache 2.0 | 18.15 GB |
 | Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
 | Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
+| Speech (optional, CPU) | Kokoro-82M v1.0, 28 English voices | Apache 2.0 | 0.34 GB, plus a 1.3 GB venv |
+| Upscaling, general | Real-ESRGAN x4plus | BSD-3-Clause | 67 MB |
+| Upscaling, game textures | 4x-PBRify UpscalerV4 (DAT2) | CC0-1.0 | 140 MB |
 
 All of them use native ComfyUI nodes; no custom nodes are installed.
 
@@ -136,8 +215,14 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, one image | TRELLIS.2, resolution 1024, 2048 px textures, 300k faces | 76 s (GLB 16.9 MB, 162k vertices) | 11.5 GB |
 | Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
+| Turnaround, from a concept image | Klein 4B, 4 views at 1024 px, framing and sheet | 81 s execution (129 s with the model swap) | 11.7 GB |
+| Turnaround with three-quarter views, `symmetric` | 8 views, 5 of them sampled | 101 s execution | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
+| Soft rig (`rig_creature`) | 8k quad manta, `wings`, 30 bones | 2 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
+| Speech, one 4 to 6 s line (measured with the load average near 10) | Kokoro-82M, 4 CPU threads, any effect | about 5 s in the runner (mostly model load); 6 to 10 s per call over MCP | none (CPU) |
+| Upscale 4x, `realesrgan-x4plus` | 1024x1024 to 4096x4096; 1536x1024 to 6144x4096 | 8.7 s; 12.1 s | |
+| Upscale, `pbrify-v4` | 1024x1024, scale 2 (4x run, then Lanczos) | 25.0 s | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
@@ -146,19 +231,21 @@ Mesh quality was checked by rendering each GLB from the four rig views in Blende
 
 ## Install or rebuild
 
-Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found.
+Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found. ffmpeg is optional too: `speak` uses it for effects and OGG output.
 
 ```bash
 setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
 setup/install.sh --root /ai --dry-run  # show what would be done, change nothing
 setup/install.sh --skip-models         # software only
-setup/download-models.sh --only video  # weights for one group (image, video, mesh); --verify rechecks SHA256
+setup/download-models.sh --only video  # weights for one group (image, video, mesh, upscale); --verify rechecks SHA256
+setup/install.sh --root /ai --with-tts # also the text to speech venv (CPU) and the Kokoro weights
 ```
 
 What gets pinned:
 - ComfyUI at commit `e08cc003` (0.45.0).
 - Both venvs from frozen lock files (`setup/comfyui-requirements.lock`, `setup/mcp-requirements.lock`).
-- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`).
+- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`). The upscale models exist only as GitHub release assets, so those entries name the release tag and are pinned by SHA256.
+- With `--with-tts`: the text to speech venv from `setup/tts-requirements.lock` (every package hashed, CPU only PyTorch) and the Kokoro files in `setup/tts.manifest`, into `<root>/models/tts`.
 
 Everything large lives under the install root: weights, venvs, uv's cache and managed Pythons, logs, outputs and temp files. Nothing goes in `/tmp` or the home directory. The scripts are idempotent; rerun them after an interruption.
 
@@ -212,6 +299,11 @@ Run state, all under `<root>/run/localgen`: `start.lock`, `supervisor.lock`, `su
 | `LOCALGEN_BLENDER` | `blender` on `PATH` | For retopology |
 | `LOCALGEN_BLENDER_THREADS` | 8 | CPU threads for Blender's bake |
 | `LOCALGEN_TIMEOUT_RETOPO` | 1800 s | |
+| `LOCALGEN_TTS_PYTHON` | `<root>/venvs/localgen-tts/bin/python` | Text to speech venv |
+| `LOCALGEN_TTS_MODEL_DIR` | `<root>/models/tts/kokoro-82m` | |
+| `LOCALGEN_TTS_THREADS` | 4 | CPU threads for synthesis |
+| `LOCALGEN_TIMEOUT_TTS` | 600 s | |
+| `LOCALGEN_FFMPEG` | `ffmpeg` on `PATH` | Effects and OGG output |
 
 ## Adding a model
 
