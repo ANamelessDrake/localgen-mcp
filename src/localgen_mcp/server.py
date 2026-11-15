@@ -578,7 +578,8 @@ async def generate_material(
     _height.png, _normal_gl.png (or _normal_dx.png), _roughness.png, _ao.png, _tile3x3.png,
     _preview.png. Returns the paths, seed, the normal convention, and seam metrics per map ("tiles"
     is true when every wrap edge is within the image's own neighbouring pixel differences).
-    About 15 to 40 s on the GPU at 1024 when warm, plus 10 to 30 s in Blender.
+    About 25 s on the GPU at 1024 when warm (longer at 2048, and again for each extra seam pass),
+    plus 5 to 15 s in Blender on the CPU.
     """
     logger.info("generate_material: %r size=%d", prompt[:80], size)
     return await materials.generate(

@@ -17,7 +17,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). `lods` adds a LOD chain sharing one texture set. Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces` or `retopo_lods`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
-| `generate_material` | Tileable PBR surface material from a prompt (optional `reference_image`, or `tile_image` to make an existing picture tile): a seamless base color plus height, normal (OpenGL +Y, or DirectX), roughness and AO maps, a 3x3 tile preview and a lit Cycles render. 1024 or 2048 px. |
+| `generate_material` | Tileable PBR surface material from a prompt (optional `reference_image`, or `tile_image` to make an existing picture tile): a seamless base color plus height, normal (OpenGL +Y, or DirectX), roughness and AO maps, a 3x3 tile preview and a lit Cycles render. 1024 or 2048 px; about 25 s warm at 1024 plus 5 to 15 s in Blender. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -97,7 +97,7 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Previews:** `_tile3x3.png` (the base color 3x3) and `_preview.png`, a Cycles render of a sphere (or `preview="plane"`) with every map under a low, raking light.
 - Files go to `<output_dir>/<name>_<seed>/` (default `/ai/output/localgen/material/<date>/`).
 
-Limits: the maps are derived from the colour, so relief follows brightness, not real geometry: painted dark stains read as dents. The roughness is a heuristic, and there is no metallic map. The repaint can soften or change detail inside the band.
+Limits: the maps are derived from the colour, so relief follows brightness, not real geometry: painted dark stains read as dents. The roughness is a heuristic, and there is no metallic map. The repaint can soften or change detail inside the band, which can show as a faint softer strip through the middle when tiled; look at the 3x3 preview. The seam metric is conservative for grids: on panel plating the wrap edge falls on a panel line, which can be the strongest transition in the image and then reads as not ok although it is not a seam.
 
 ### Idle timeout
 
