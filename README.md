@@ -11,7 +11,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 
 | Tool | What it does |
 |---|---|
-| `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). `count` queues several at once with one model load. |
+| `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). With `input_image` and `denoise`, image to image; `mask_image` limits the change to a region and leaves the rest byte for byte (below). `count` queues several at once with one model load. |
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
@@ -22,6 +22,18 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
 
 Every generation tool takes optional `output_dir`, `seed`, `model` and `idle_timeout_seconds`. Outputs default to `/ai/output/localgen/<modality>/<date>/`. Long jobs send MCP progress notifications.
+
+### Image to image and masked editing
+
+`generate_image(input_image=..., denoise=..., mask_image=...)` starts from an image instead of noise.
+- **Image to image:** the input is VAE encoded and sampled with partial `denoise` (0.05 to 1.0, default 0.6 for Z-Image Turbo). Z-Image holds on to the input strongly: at 0.3 and 0.6 only fine detail changes, at 0.9 the layout stays and colours and materials change, and 1.0 ignores the input. The prompt describes the whole result.
+- **Denoise with few steps:** KSampler runs `steps` steps of an `int(steps / denoise)` step schedule, so at Z-Image's 8 steps any denoise from 0.89 up would be a full schedule from pure noise (measured: 0.9 gave an unrelated image). The graph picks 8 to 16 steps so the applied value is within 0.01 of the request up to 0.9; above that it is at most 0.94 (16 of 17 steps), so below 1 the input always counts. Klein's custom sampler gets the same treatment.
+- **Size:** any input size works. It is worked on at about 1 megapixel with both sides a multiple of 16 and resized back, so the output has the input's size; `width` and `height` are refused with `input_image`.
+- **Mask:** a black and white image, white = change, black = keep, read from its red channel and stretched to the input if its size differs. Sampling is limited to the mask (`SetLatentNoiseMask`), then the result is pasted over the original (`ImageCompositeMasked`) with the mask grown and feathered by 8 pixels. Every pixel more than about 18 px outside the white area is the original's, byte for byte (measured below). To replace what is in the region use `denoise` 1.0; to recolour an object, Klein follows the prompt better than Z-Image, which at 0.9 keeps some of the old colour.
+- **With `reference_images`** (or `model="flux2-klein-4b"`): FLUX.2 Klein edits `input_image` as image 1, with the references as images 2 to 4 (so at most 3). It starts from the input's latent too, with `denoise` default 1.0, which is Klein's usual reference guided edit; `mask_image` limits it the same way.
+- Refused combinations: `mask_image` or `denoise` without `input_image`, and `width` or `height` with it.
+- Measured through the MCP server on a 1024x1024 image (Z-Image at 0.9, and Klein) and a 1001x757 one with a 433x311 mask (Z-Image at 1.0): no pixel more than 18 px outside the mask changed; from 16 to 18 px at most by one level; from 8 to 16 px by at most 8 (34 for Klein). Without the composite step, 99% of the pixels outside the mask changed by up to 22 levels (the VAE round trip).
+- The input's alpha channel is dropped (the output is RGB). Like every input image, the mask is uploaded only after a content check.
 
 ### Multi-view framing
 
