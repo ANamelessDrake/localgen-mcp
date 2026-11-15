@@ -17,9 +17,11 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). `lods` adds a LOD chain sharing one texture set. Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces` or `retopo_lods`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
+| `remove_background` | Cut the subject out of 1 to 64 images in one batch (BiRefNet): RGBA PNGs with a transparent background. Optional `trim` to the subject with `padding`, `square` canvas, output `size`, or a solid `background` colour. For UI icons, item sprites and compositing. |
 | `speak` | Text to speech for game dialogue (Kokoro-82M, English, on the CPU): 24 kHz WAV plus OGG, in one of 28 voices or a blend, with an optional `effect` (`radio`, `robotic`, `glitch` for a voice struggling on low power). Needs `install.sh --with-tts`. |
 | `list_voices` | The installed voices (accent, gender, quality grade), the effects, and whether ffmpeg was found. |
 | `rig_creature` | Soft rig for an organic creature: bone chains (`chain` for tentacles, tails and vines; `spine`; `wings` for rays and other flat flyers; `auto` picks) with smooth skin weights, at most 4 per vertex, so engine scripts or physics can bend it. Writes a GLB and an FBX. Headless Blender on the CPU, a few seconds. |
+| `upscale_image` | Upscale a PNG or JPEG 2x or 4x with a super resolution model: Real-ESRGAN x4plus for concept art and general images, or 4x-PBRify V4 (`model="pbrify-v4"`) for game textures. Keeps transparency. A few seconds to a minute. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -94,6 +96,16 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
+### Background removal
+
+`remove_background` takes a list of images and returns one PNG per image, the subject opaque and the background transparent.
+- **No options:** each cut-out is the size of its input and lines up with it, ready for compositing.
+- **`trim=True`:** crops to the subject's bounding box, plus `padding` on every side as a fraction of the subject's longer side (default 0.05; 0 for a tight crop). The result reports the box found, in input pixels.
+- **`square=True`:** centres the result on a square transparent canvas. **`size`:** scales the longer side to that many pixels (with `square`, size x size). **`background="#rrggbb"`:** flattens onto a solid colour instead (RGB PNG).
+- Typical calls: a UI icon is `trim=True, square=True, size=256`; an item sprite is `trim=True, padding=0`.
+- **How:** one ComfyUI prompt holds a chain per image, so BiRefNet loads once for the batch: `RemoveBackground` gives the foreground mask, and `JoinImageWithAlpha` gets `InvertMask` of it, because it inverts its alpha input (it expects LoadImage's 1 - alpha convention). With any option set, a second prompt without a model crops, pads, scales and flattens each cut-out using native nodes (`ImageCrop`, `ImageCompositeMasked`, `ImageScale` with Lanczos). No native node returns a bounding box as numbers, so pass 1 also saves a 512 px copy of the mask and the server reads the box from it with the standard library, rounding outwards.
+- **Limits:** the edge colour is the original pixel colour, so semi-transparent edges (hair, fur) keep a trace of the old background; a plain background that contrasts with the subject gives the cleanest result. Mask values under about 5% count as background when finding the box. Only the first frame of an animated GIF or WebP is used. BiRefNet's mask tops out just under 1, so the subject's alpha is 253 or 254 rather than 255. With layout options the job is two prompts, and on a busy shared backend each waits its turn in the queue.
+
 ### Speech
 
 `speak` turns one line of English into a WAV file for game dialogue. It does not use ComfyUI or the GPU, so it runs beside image and video jobs.
@@ -126,6 +138,14 @@ Limits: every view is painted separately, so the views can disagree on details. 
   - Distance weights are Euclidean, so parts that touch without being connected (a tentacle curled against the body) pull on each other.
   - On `wings`, the body is a fixed strip (12% of the half span each side of the middle). Anything outside it, such as a manta's head lobes, moves with the nearest wing chain.
 
+### Upscaling
+
+`upscale_image` runs a 4x super resolution model with ComfyUI's native `UpscaleModelLoader` and `ImageUpscaleWithModel` nodes.
+- **Models:** `realesrgan-x4plus` (default) is a general upscaler that also cleans up mild noise and JPEG artefacts; it suits concept art, renders and photos. `pbrify-v4` is trained on game textures and keeps more fine surface detail, at about 3 times the run time. Both allow commercial use (BSD-3-Clause and CC0); see [docs/model-choices.md](docs/model-choices.md#upscaling-added-2026-11-15).
+- **Scale:** 4 is the models' native scale. 2 downscales the 4x result by half with Lanczos, so one model serves both scales.
+- **Alpha:** a PNG with transparency keeps it (`keep_alpha=false` drops it). The model upscales the colour, and the alpha channel is resized bilinearly. Colour hidden under fully transparent pixels is upscaled too, so edges look as clean as the source's.
+- **Large images:** the upscale node works in 512 px tiles (halved if the GPU runs out of memory), so VRAM is not the limit. The result is limited to 8192 px per side: 2048 px inputs at 4x, 4096 px at 2x. Output is an 8-bit PNG named `<input>_x<scale>.png`.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -145,6 +165,8 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 | Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
 | Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
 | Speech (optional, CPU) | Kokoro-82M v1.0, 28 English voices | Apache 2.0 | 0.34 GB, plus a 1.3 GB venv |
+| Upscaling, general | Real-ESRGAN x4plus | BSD-3-Clause | 67 MB |
+| Upscaling, game textures | 4x-PBRify UpscalerV4 (DAT2) | CC0-1.0 | 140 MB |
 
 All of them use native ComfyUI nodes; no custom nodes are installed.
 
@@ -168,6 +190,8 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Soft rig (`rig_creature`) | 8k quad manta, `wings`, 30 bones | 2 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
 | Speech, one 4 to 6 s line (measured with the load average near 10) | Kokoro-82M, 4 CPU threads, any effect | about 5 s in the runner (mostly model load); 6 to 10 s per call over MCP | none (CPU) |
+| Upscale 4x, `realesrgan-x4plus` | 1024x1024 to 4096x4096; 1536x1024 to 6144x4096 | 8.7 s; 12.1 s | |
+| Upscale, `pbrify-v4` | 1024x1024, scale 2 (4x run, then Lanczos) | 25.0 s | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
@@ -182,14 +206,14 @@ Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.ast
 setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
 setup/install.sh --root /ai --dry-run  # show what would be done, change nothing
 setup/install.sh --skip-models         # software only
-setup/download-models.sh --only video  # weights for one group (image, video, mesh); --verify rechecks SHA256
+setup/download-models.sh --only video  # weights for one group (image, video, mesh, upscale); --verify rechecks SHA256
 setup/install.sh --root /ai --with-tts # also the text to speech venv (CPU) and the Kokoro weights
 ```
 
 What gets pinned:
 - ComfyUI at commit `e08cc003` (0.45.0).
 - Both venvs from frozen lock files (`setup/comfyui-requirements.lock`, `setup/mcp-requirements.lock`).
-- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`).
+- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`). The upscale models exist only as GitHub release assets, so those entries name the release tag and are pinned by SHA256.
 - With `--with-tts`: the text to speech venv from `setup/tts-requirements.lock` (every package hashed, CPU only PyTorch) and the Kokoro files in `setup/tts.manifest`, into `<root>/models/tts`.
 
 Everything large lives under the install root: weights, venvs, uv's cache and managed Pythons, logs, outputs and temp files. Nothing goes in `/tmp` or the home directory. The scripts are idempotent; rerun them after an interruption.
