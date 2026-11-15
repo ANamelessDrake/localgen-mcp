@@ -13,13 +13,18 @@ stills of different poses share one scale): for example
 The mesh is scaled so its largest bounding box side is 1 and centred at the
 origin, as the rig assumes; cameras follow nodes_trellis2._orbit_camera_to_world
 (Z up, azimuth 0 looks along +Y, horizontal FOV 20, distance 1.1*0.5/tan(10 deg)).
+The rig itself lives in src/localgen_mcp/blender/_rig.py, shared with the server's
+render_rig_views.py (generate_turnaround's mesh guide).
 """
 import math
+import os
 import re
 import sys
 
 import bpy
-from mathutils import Matrix, Vector
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "localgen_mcp", "blender"))
+import _rig  # noqa: E402
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 poses = []
@@ -49,19 +54,9 @@ if only:
     if not meshes:
         raise SystemExit(f"no mesh object named {only!r} in {src}")
 
-lo = Vector((1e9,) * 3)
-hi = Vector((-1e9,) * 3)
-for o in meshes:
-    for c in o.bound_box:
-        w = o.matrix_world @ Vector(c)
-        lo = Vector(map(min, lo, w))
-        hi = Vector(map(max, hi, w))
-centre, extent = (lo + hi) / 2, max(hi - lo)
-fix = Matrix.Scale(1.0 / extent, 4) @ Matrix.Translation(-centre)
-for o in bpy.context.scene.objects:
-    if o.parent is None:
-        o.matrix_world = fix @ o.matrix_world
-print(f"bbox extent {tuple(round(v, 3) for v in (hi - lo))}, scaled by {1 / extent:.4f}")
+size3 = _rig.frame(meshes)
+extent = max(size3)
+print(f"bbox extent {tuple(round(v, 3) for v in size3)}, scaled by {1 / extent:.4f}")
 
 # Pose after framing, so stills of different poses share one scale.
 for rig in (o for o in bpy.context.scene.objects if o.type == "ARMATURE"):
@@ -107,21 +102,8 @@ sun.data.energy = 2.0
 sun.rotation_euler = (math.radians(50), 0, math.radians(30))
 scene.collection.objects.link(sun)
 
-cam_data = bpy.data.cameras.new("cam")
-cam_data.sensor_fit = "HORIZONTAL"
-cam_data.angle = math.radians(20)
-cam = bpy.data.objects.new("cam", cam_data)
-scene.collection.objects.link(cam)
-scene.camera = cam
-dist = 1.1 * 0.5 / math.tan(math.radians(10))
-for name, az in (("front", 0), ("left", 90), ("back", 180), ("right", 270)):
-    a = math.radians(az)
-    back = Vector((math.sin(a), -math.cos(a), 0))
-    right = Vector((math.cos(a), math.sin(a), 0))
-    up = back.cross(right)
-    m = Matrix.Identity(4)
-    for i in range(3):
-        m[i][0], m[i][1], m[i][2], m[i][3] = right[i], up[i], back[i], back[i] * dist
-    cam.matrix_world = m
+cam = _rig.add_camera(scene)
+for name, az in _rig.VIEWS.items():
+    _rig.place(cam, az)
     scene.render.filepath = f"{prefix}_{name}.png"
     bpy.ops.render.render(write_still=True)

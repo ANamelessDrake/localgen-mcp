@@ -391,6 +391,9 @@ def _part_boxes(parts: list[dict], width: int, height: int) -> list[dict]:
     return out
 
 
+GUIDE_FACES = 50000  # the guide mesh only has to carry the shape; fewer faces render faster
+
+
 @mcp.tool()
 async def generate_turnaround(
     concept_image: str | None = None,
@@ -400,6 +403,9 @@ async def generate_turnaround(
     symmetric: bool = False,
     background: str = "#d8d8d8",
     mesh: bool = False,
+    guide: str = "none",
+    guide_denoise: float | None = None,
+    guide_source: str = "front",
     view_size: int | None = None,
     steps: int | None = None,
     seed: int | None = None,
@@ -407,27 +413,42 @@ async def generate_turnaround(
     idle_timeout_seconds: int | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Make consistent turnaround views of one object (front, left, back, right) from a concept image.
+    """Make consistent turnaround views of one object (front, left, back and right) from a concept image.
 
     Give concept_image (a local PNG or JPEG of the object, any angle), or only prompt to generate the
     concept first with the image model. subject: a few words naming the object and its key parts
     ("a salvage robot with a cargo cage on its back and tread feet"); it goes into every view's prompt
     and defaults to prompt. Naming the parts helps them appear in every view.
     FLUX.2 Klein first redraws the concept as a clean front view (flat even lighting, no cast shadows,
-    plain background), then draws each other view from that front and the concept. Views follow
-    Pixal3D's rig: the left view shows the object's own left side, facing image-left.
+    plain background). Views follow Pixal3D's rig: the left view shows the object's own left side,
+    facing image-left.
+    guide="none" (default, better for standing objects): each other view is drawn from the clean
+    front and the concept from an empty latent, then scaled by silhouette height (which assumes a
+    standing object seen level). Flat, winged or wide objects tend to come out facing the camera in
+    every view (a moth with its wings spread flat in the side views).
+    guide="mesh" (for flat, winged or wide objects): TRELLIS.2 meshes the clean front view (a guide
+    mesh; guide_source="concept" meshes the concept instead, and a failure from the front retries
+    from the concept), Blender renders it from the rig's cameras (turned by guide_yaw, found by
+    matching the mesh to that image, since TRELLIS.2 does not always face a mesh's front to the
+    rig's front), and Klein repaints each render image to image (guide_denoise, default 0.6, 0.3 to
+    0.95: lower keeps more of the render) with the clean front and the concept as references. The
+    renders fix each view's pose and silhouette, so a moth's wings are edge-on from the side, and
+    the views come out already framed for the rig. The views are only as right as TRELLIS.2's guess
+    at the hidden sides: on a robot it copied the face onto the back, which guide="none" got right.
     three_quarter=True adds front_left, back_left, back_right and front_right views (for reference;
     meshing uses the four main views). symmetric=True draws only the left-hand views and mirrors them
     into the right-hand ones, which keeps a left-right symmetric object consistent (do not use it for
     asymmetric objects).
-    Every view is framed for Pixal3D: square, the object centred, the same scale in every view (each
-    view is scaled to the same silhouette height, which assumes a standing object seen level), the
-    widest view at 1/1.1 of the frame. Views are RGBA PNGs (alpha is the foreground) on `background`;
-    a sheet puts them side by side.
+    Every view is square, the object centred at one scale, the widest view at 1/1.1 of the frame.
+    Views are RGBA PNGs (alpha is a BiRefNet foreground mask) on `background`; a sheet puts them
+    side by side.
     mesh=True also meshes the four views with generate_mesh's multi-view path (framing "as_framed").
     Views are generated, so they can still disagree on details: look at them before relying on them.
-    Returns the view paths by name, the raw (unframed) views, the sheet, the concept, and the mesh
-    result when asked. About 6 s per view warm, plus model loads.
+    Returns the view paths by name, the sheet, the concept, the clean front, and with guide="mesh"
+    the guide mesh ("guide_mesh", a usable single view TRELLIS.2 mesh on its own) and its renders
+    ("guide_renders"); with guide="none" the raw (unframed) views; the mesh result when asked.
+    About 6 s per view warm plus model loads; guide="mesh" adds a TRELLIS.2 run (about 1 to 2
+    minutes) and the Blender renders (about 10 s per view on the CPU).
     """
     from .workflows import turnaround
 
@@ -436,8 +457,11 @@ async def generate_turnaround(
     wf = workflows.get("turnaround")
     overrides = {"subject": (subject or prompt or "the object").strip().rstrip("."), "three_quarter": three_quarter,
                  "symmetric": symmetric, "background": background, "view_size": view_size, "steps": steps,
-                 "seed": seed}
-    turnaround.check(wf.params(overrides))  # fail on bad options before any GPU work
+                 "seed": seed, "guide": guide, "guide_denoise": guide_denoise}
+    params = wf.params(overrides)
+    turnaround.check(params)  # fail on bad options before any GPU work
+    if guide_source not in ("front", "concept"):
+        raise ValueError('guide_source must be "front" or "concept"')
     concept = None
     if concept_image:
         path = Path(concept_image).expanduser().resolve()
@@ -450,10 +474,16 @@ async def generate_turnaround(
         reference = await generate_image(prompt + turnaround.CONCEPT_SUFFIX, seed=seed, output_dir=output_dir,
                                          idle_timeout_seconds=idle_timeout_seconds, ctx=ctx)
         concept = reference["paths"][0]
-    logger.info("generate_turnaround: %s (%s)", concept, wf.name)
-    result = await jobs.run_workflow(settings, wf, [overrides], output_dir, idle_timeout_seconds,
-                                     images={"concept": concept}, timeout=TIMEOUTS["image"], progress=progress)
-    result.update(turnaround.classify(result["paths"]))
+    logger.info("generate_turnaround: %s (%s, guide=%s)", concept, wf.name, guide)
+    if guide == "mesh":
+        result = await _guided_turnaround(wf, overrides, params, concept, guide_source, output_dir,
+                                          idle_timeout_seconds, ctx)
+    else:
+        result = await jobs.run_workflow(settings, wf, [{**overrides, "stage": "full"}], output_dir,
+                                         idle_timeout_seconds, images={"concept": concept},
+                                         timeout=TIMEOUTS["image"], progress=progress)
+        result.update(turnaround.classify(result["paths"]))
+        result["clean_front"] = result["raw"].get("front")
     result["concept_image"] = concept
     if reference is not None:
         result["concept_seconds"] = reference["total_seconds"]
@@ -464,6 +494,68 @@ async def generate_turnaround(
                                              framing="as_framed", remove_background=False, seed=seed,
                                              output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds,
                                              ctx=ctx)
+    return result
+
+
+async def _guided_turnaround(wf, overrides, params, concept, guide_source, output_dir, idle_timeout_seconds,
+                             ctx) -> dict:
+    """guide="mesh": clean front, TRELLIS.2 guide mesh, rig renders in Blender, views painted from the renders."""
+    from .workflows import turnaround
+
+    progress = _progress(ctx)
+    front = await jobs.run_workflow(settings, wf, [{**overrides, "stage": "front"}], output_dir,
+                                    idle_timeout_seconds, images={"concept": concept},
+                                    timeout=TIMEOUTS["image"], progress=progress)
+    clean_front = turnaround.classify(front["paths"])["clean_front"]
+    seed = front["outputs"][0]["seed"]  # one seed for every stage, so a run reproduces from the reported seed
+    sources = {"front": clean_front, "concept": concept}
+    order = [guide_source] + [k for k in sources if k != guide_source]
+    warnings = []
+    for i, source in enumerate(order):
+        try:
+            guide_mesh = await generate_mesh(input_image=sources[source], face_count=GUIDE_FACES, texture_size=1024,
+                                             seed=seed, output_dir=front["output_dir"],
+                                             idle_timeout_seconds=idle_timeout_seconds, ctx=ctx)
+            break
+        except jobs.JobError as e:
+            # A furry or spiky clean front can make TRELLIS.2 extract tens of millions of faces, whose
+            # remesh runs out of GPU memory; the concept usually meshes. The concept must then show the
+            # object from the front, since the guide mesh's front is the image's view.
+            if i + 1 == len(order):
+                raise
+            warnings.append(f"guide mesh from the {source} failed ({str(e).splitlines()[0][:200]}); "
+                            f"made it from the {order[i + 1]} instead")
+            logger.warning("generate_turnaround: %s", warnings[-1])
+    glb = guide_mesh["paths"][0]
+    views = turnaround.ordered(turnaround.views_for(bool(params["three_quarter"])))
+    todo = turnaround.sampled(views, bool(params["symmetric"]))
+    stem = Path(clean_front).name.split("_clean_front")[0]
+    prefix = Path(front["output_dir"]) / f"{stem}_guide"
+    bg = params["background"]
+    spec = {"mesh": glb, "prefix": str(prefix), "size": int(params["view_size"]), "samples": 32,
+            "views": {v: turnaround.ALL_VIEWS[v] for v in todo},
+            "background": [int(bg[i:i + 2], 16) for i in (1, 3, 5)],
+            "match": sources[source]}  # TRELLIS.2 does not always face the mesh's front to -Y
+    renders = await blender_run.run(settings, "render_rig_views.py", [json.dumps(spec)], "RIG_VIEWS_RESULT",
+                                    Path(f"{prefix}_{todo[-1]}.png"))
+    images = {"concept": concept, "front": clean_front,
+              **{turnaround.GUIDE_SLOT + v: p for v, p in renders["views"].items()}}
+    result = await jobs.run_workflow(settings, wf, [{**overrides, "stage": "paint", "seed": seed}],
+                                     front["output_dir"], idle_timeout_seconds, images=images,
+                                     timeout=TIMEOUTS["image"], progress=progress)
+    result.update(turnaround.classify(result["paths"]))
+    result["paths"] = [clean_front, glb, *renders["views"].values(), *result["paths"]]
+    result["clean_front"] = clean_front
+    result["guide_mesh"] = glb
+    result["seed"] = seed
+    result["guide_source"] = source
+    result["warnings"] = warnings
+    result["guide_renders"] = renders["views"]
+    result["guide_bbox"] = renders["bbox"]
+    result["guide_yaw"] = renders.get("yaw", 0)
+    result["stage_seconds"] = {"front": front["total_seconds"], "guide_mesh": guide_mesh["total_seconds"],
+                               "renders": renders["seconds"], "paint": result["total_seconds"]}
+    result["total_seconds"] = round(sum(result["stage_seconds"].values()), 2)
     return result
 
 
