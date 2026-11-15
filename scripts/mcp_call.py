@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 
@@ -20,7 +21,8 @@ from mcp.client.stdio import stdio_client
 
 
 async def run(tool: str | None, args: dict, list_tools: bool) -> int:
-    params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"])
+    # Pass this environment on (PYTHONPATH, LOCALGEN_*): the SDK otherwise gives the server only a few variables.
+    params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"], env=dict(os.environ))
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
