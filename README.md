@@ -80,6 +80,14 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
+### Turnarounds
+
+`generate_turnaround` makes the views a multi-view mesh needs from one concept image (or from a prompt, generating the concept first).
+- **Views:** FLUX.2 Klein redraws the concept as a clean front view, then draws left, back and right (and with `three_quarter=True` the four diagonals) from references [clean front, concept]. Every prompt asks for flat even lighting, no cast shadows and a plain background, and names which way the object faces: the left view shows the object's own left side, facing image-left, as in Pixal3D's rig. `subject` names the object and its parts; parts named there turn up in more views.
+- **Framing:** each view gets a BiRefNet mask and is scaled so its silhouette has the same height as in every other view, then all views are cropped by one square box around the union of their silhouettes. So every view has one scale, the object is centred, and the widest view spans 1/1.1 of the frame, as the rig wants. This assumes the object's height is the same from every side, which holds for a standing object seen level. The views are RGBA PNGs (alpha is the mask), plus a sheet of them side by side.
+- **Meshing:** `mesh=True` feeds the four main views to `generate_mesh` with `framing="as_framed"` and the views' own alpha.
+- **Limits:** the views are drawn separately, so small asymmetric parts can drift between them. On the test robot, with a generic `subject`, its one antenna came out doubled in the back view, or on the wrong side, depending on the seed; large parts (head, cargo cage, arms, treads) stayed consistent. Naming the part and its side in `subject` ("exactly one antenna, behind the right side of its head (its own right)") gave one antenna, on the right side, in every view. Starting the back view from the mirrored front did not help (at denoise 0.7 the back kept the face). `symmetric=True` mirrors the left-hand views into the right-hand ones, which keeps left and right consistent for symmetric objects only. Look at the views before meshing.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -117,6 +125,8 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, one image | TRELLIS.2, resolution 1024, 2048 px textures, 300k faces | 76 s (GLB 16.9 MB, 162k vertices) | 11.5 GB |
 | Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
+| Turnaround, from a concept image | Klein 4B, 4 views at 1024 px, framing and sheet | 81 s execution (129 s with the model swap) | 11.7 GB |
+| Turnaround with three-quarter views, `symmetric` | 8 views, 5 of them sampled | 101 s execution | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
