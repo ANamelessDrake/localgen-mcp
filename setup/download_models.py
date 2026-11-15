@@ -116,7 +116,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models-dir", required=True, type=Path, help="ComfyUI models directory")
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    ap.add_argument("--only", action="append", choices=["image", "video", "mesh"],
+    ap.add_argument("--only", action="append", choices=["image", "video", "mesh", "tts"],
                     help="limit to a group (repeatable); default all groups")
     ap.add_argument("--file", action="append", default=[], metavar="TARGET",
                     help="limit to manifest targets containing this text (repeatable), for example vae/ae")

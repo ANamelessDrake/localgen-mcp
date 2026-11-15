@@ -1,0 +1,13 @@
+# Text to speech venv (<root>/venvs/localgen-tts): Kokoro-82M on the CPU.
+# The MCP server never imports these; it runs src/localgen_mcp/tts_runner.py with this venv's Python.
+# Regenerate the lock (setup/tts-requirements.lock) with:
+#   uv pip compile setup/tts-requirements.in --python-version 3.12 --generate-hashes \
+#     --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
+#     --index-strategy unsafe-best-match -o setup/tts-requirements.lock
+kokoro==0.9.4
+misaki[en]==0.9.4
+torch==2.14.1+cpu
+soundfile
+numpy
+# spaCy's small English pipeline: misaki would otherwise download it on first use.
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
