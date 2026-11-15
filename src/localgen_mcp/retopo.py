@@ -11,7 +11,7 @@ import re
 import time
 from pathlib import Path
 
-from . import blender_run
+from . import blender_run, model_files
 from .blender_run import BlenderError as RetopoError  # noqa: F401  (re-exported for callers and tests)
 from .config import Settings
 
@@ -32,6 +32,10 @@ def validate(input_mesh: str, target_faces: int, method: str, texture_size: int)
         raise RetopoError(f"mesh not found: {path}")
     if not is_glb(path):
         raise RetopoError(f"not a binary glTF (.glb) file: {path}")
+    try:
+        model_files.require_self_contained(path)
+    except model_files.ModelFileError as exc:
+        raise RetopoError(str(exc)) from None
     if method not in METHODS:
         raise RetopoError(f"method must be one of {METHODS}")
     lo, hi = FACE_RANGE

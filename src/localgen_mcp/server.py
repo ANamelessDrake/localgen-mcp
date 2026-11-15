@@ -24,7 +24,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, jobs, retopo, workflows
+from . import backend, blender_run, config, jobs, model_files, retopo, workflows
 
 
 def _configure_logging() -> logging.Logger:
@@ -286,6 +286,7 @@ async def texture_mesh(
         raise ValueError(f"input mesh not found: {src}")
     if src.suffix.lower() not in MESH_INPUTS:
         raise ValueError(f"input mesh must be one of {MESH_INPUTS}")
+    model_files.require_self_contained(src)  # no glTF buffer or image URIs pointing at other files
     # Re-serialise through Blender and upload only that: ComfyUI's input folder can be served on
     # the LAN by a hand-started instance, so the caller's own bytes are never copied there.
     work = settings.root / "tmp" / f"texture-{uuid.uuid4().hex[:10]}"

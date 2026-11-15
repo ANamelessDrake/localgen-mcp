@@ -4,6 +4,7 @@ is installed) a real run on a textured fixture for both methods."""
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 import sys
@@ -94,3 +95,30 @@ def test_texture_input_is_reserialised_without_foreign_bytes(settings, tmp_path)
     assert report["faces"] == 2
     data = dst.read_bytes()
     assert data[:4] == b"glTF" and secret.encode() not in data
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender is not installed")
+def test_texture_input_drops_materials_and_referenced_images(settings, tmp_path):
+    """An OBJ's .mtl can name any image on disk as a texture; the re-export must not carry it."""
+    from localgen_mcp import blender_run
+    elsewhere = tmp_path / "private"
+    elsewhere.mkdir()
+    marker = b"PRIVATE-PHOTO-BYTES-0123456789"
+    # a valid PNG (so Blender would load it) carrying a marker in a text chunk
+    import struct, zlib
+    def chunk(k, d):
+        return struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+           + chunk(b"tEXt", b"Comment\0" + marker) + chunk(b"IDAT", zlib.compress(b"\0" + b"\xff" * 6 + b"\0" + b"\xff" * 6))
+           + chunk(b"IEND", b""))
+    (elsewhere / "photo.png").write_bytes(png)
+    (tmp_path / "model.mtl").write_text(f"newmtl m\nmap_Kd {elsewhere / 'photo.png'}\n")
+    src = tmp_path / "model.obj"
+    src.write_text("mtllib model.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nusemtl m\nf 1/1 2/2 3/3\n")
+    dst = tmp_path / "clean.glb"
+    asyncio.run(blender_run.run(settings, "convert_mesh.py", [src, dst], "CONVERT_RESULT", dst))
+    data = dst.read_bytes()
+    assert marker not in data and b"\x89PNG" not in data
+    doc = json.loads(data[20:20 + int.from_bytes(data[12:16], "little")])
+    assert not doc.get("images") and not doc.get("materials")
+    assert doc["meshes"][0]["primitives"][0]["attributes"].get("TEXCOORD_0") is not None  # UVs kept
