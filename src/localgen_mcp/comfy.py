@@ -84,11 +84,15 @@ class ComfyClient:
         return self.get_json(f"/history/{prompt_id}").get(prompt_id)
 
     def upload_image(self, path: Path, subfolder: str = "localgen") -> str:
-        """Upload a local image to ComfyUI's input folder; returns the name LoadImage expects."""
+        """Upload a local file to ComfyUI's input folder; returns the name LoadImage expects.
+
+        The stored name gets a random prefix, so concurrent jobs (several agents share one backend)
+        never overwrite, or later delete, each other's inputs when their files share a name."""
         boundary = uuid.uuid4().hex
         ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        stored = f"{uuid.uuid4().hex[:12]}_{path.name}"
         parts = [
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{path.name}\"\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{stored}\"\r\n"
             f"Content-Type: {ctype}\r\n\r\n".encode() + path.read_bytes() + b"\r\n",
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"subfolder\"\r\n\r\n{subfolder}\r\n".encode(),
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n".encode(),
