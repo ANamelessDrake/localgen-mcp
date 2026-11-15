@@ -27,7 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = HERE / "models.manifest"
 CHUNK = 8 * 1024 * 1024
-GROUPS = ("image", "video", "mesh", "upscale")
+GROUPS = ("image", "video", "mesh", "tts", "upscale")
 # repo "github:<owner>/<name>" fetches a release asset instead of a Hugging Face file,
 # for weights that are only published as GitHub releases.
 GITHUB_PREFIX = "github:"

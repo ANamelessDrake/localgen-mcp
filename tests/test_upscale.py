@@ -148,6 +148,13 @@ def test_manifest_pins_every_upscale_model():
     assert not hf.is_github and hf.url.startswith("https://huggingface.co/")
 
 
+def test_every_manifest_parses():
+    # read_manifest rejects unknown groups, so every group used in a manifest must be in GROUPS
+    dm = _downloader()
+    for manifest in sorted(SETUP.glob("*.manifest")):
+        assert dm.read_manifest(manifest), manifest
+
+
 def test_manifest_rejects_bad_lines(tmp_path):
     dm = _downloader()
     good = "a" * 64
