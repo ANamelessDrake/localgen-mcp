@@ -260,6 +260,25 @@ async def retopologize_mesh(
                                      detail, detail_strength)
 
 
+def _reuse_file(root: Path, entry, kind: str) -> str | None:
+    """A file recorded in a parts state file, only if it is a relative path inside root and still passes
+    the checks a fresh input would. The state file sits in a caller-chosen folder, so it is not trusted."""
+    if not isinstance(entry, str) or Path(entry).is_absolute():
+        return None
+    path = (root / entry).resolve()
+    if root not in path.parents or not path.is_file():
+        return None
+    try:
+        if kind == "image":
+            return str(path) if jobs.is_image_file(path) else None
+        if path.suffix.lower() != ".glb" or not retopo.is_glb(path):
+            return None
+        model_files.require_self_contained(path)
+        return str(path)
+    except (OSError, ValueError):
+        return None
+
+
 def _part_boxes(parts: list[dict], width: int, height: int) -> list[dict]:
     """Validate the part list; boxes given as fractions (0..1) become pixels."""
     if not parts:
@@ -345,10 +364,21 @@ async def generate_parts(
     def save_state() -> None:
         state_path.write_text(json.dumps(state, indent=1))
 
+    root = outdir.resolve()
+
+    def rel(path: str) -> str:
+        return str(Path(path).resolve().relative_to(root))
+
+    def reuse(entry, kind):
+        return _reuse_file(root, entry, kind)
+
     for i, sp in enumerate(specs):
         old = state.get(sp["name"], {})
-        if old.get("key") == key(sp, i):
-            sp.update({k: old[k] for k in ("image", "mesh") if old.get(k) and Path(old[k]).is_file()})
+        if isinstance(old, dict) and old.get("key") == key(sp, i):
+            for kind in ("image", "mesh"):
+                found = reuse(old.get(kind), kind)
+                if found:
+                    sp[kind] = found
 
     # 1. Isolate the parts not done yet in one batch, so Klein loads once.
     iso = workflows.get("part")
@@ -369,20 +399,20 @@ async def generate_parts(
                                            progress=progress)
         for (i, sp), out in zip(todo, isolated["outputs"]):
             sp["image"] = out["paths"][0]
-            state[sp["name"]] = {"key": key(sp, i), "image": sp["image"]}
+            state[sp["name"]] = {"key": key(sp, i), "image": rel(sp["image"])}
         save_state()
 
     # 2. Mesh the whole object (placement reference) and each part.
     mesh_wf = workflows.get("mesh", "trellis2")
-    if not full_mesh and Path(state.get("_reference", {}).get("mesh", "/nonexistent")).is_file() \
-            and state["_reference"].get("key") == json.dumps([str(concept), concept.stat().st_mtime, seed]):
-        full_mesh = state["_reference"]["mesh"]
+    ref = state.get("_reference") if isinstance(state.get("_reference"), dict) else {}
+    if not full_mesh and ref.get("key") == json.dumps([str(concept), concept.stat().st_mtime, seed]):
+        full_mesh = reuse(ref.get("mesh"), "mesh")
     if not full_mesh:
         whole = await jobs.run_workflow(settings, mesh_wf, [{"seed": seed}], str(outdir / "reference"),
                                         idle_timeout_seconds, images={"image": str(concept)},
                                         timeout=TIMEOUTS["mesh"], progress=progress)
         full_mesh = whole["paths"][0]
-        state["_reference"] = {"key": json.dumps([str(concept), concept.stat().st_mtime, seed]), "mesh": full_mesh}
+        state["_reference"] = {"key": json.dumps([str(concept), concept.stat().st_mtime, seed]), "mesh": rel(full_mesh)}
         save_state()
     for i, sp in enumerate(specs):
         if sp.get("mesh"):
@@ -391,7 +421,7 @@ async def generate_parts(
                                       str(outdir / "parts"), idle_timeout_seconds, images={"image": sp["image"]},
                                       timeout=TIMEOUTS["mesh"], progress=progress)
         sp["mesh"] = res["paths"][0]
-        state[sp["name"]]["mesh"] = sp["mesh"]
+        state[sp["name"]]["mesh"] = rel(sp["mesh"])
         save_state()
 
     # 3. Assemble and rig in Blender.

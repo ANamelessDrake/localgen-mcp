@@ -72,3 +72,27 @@ def test_retopology_wants_a_glb_name_and_content(tmp_path):
     p.write_bytes(_glb({"asset": ASSET}))
     with pytest.raises(retopo.RetopoError, match="binary glTF"):
         retopo.validate(str(p), 10000, "quad", 2048)
+
+
+def test_resume_state_cannot_point_outside_the_run(tmp_path):
+    from localgen_mcp.server import _reuse_file
+    run = tmp_path / "run"
+    (run / "parts").mkdir(parents=True)
+    good = run / "parts" / "a.glb"
+    good.write_bytes(_glb({"asset": ASSET}))
+    png = run / "a.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 32)
+    outside = tmp_path / "secret.glb"
+    outside.write_bytes(_glb({"asset": ASSET}))
+    leaky = run / "parts" / "leaky.glb"
+    leaky.write_bytes(_glb({"asset": ASSET, "buffers": [{"byteLength": 64, "uri": "/etc/hostname"}]}))
+    notes = run / "notes.png"
+    notes.write_text("not an image")
+    root = run.resolve()
+    assert _reuse_file(root, "parts/a.glb", "mesh") == str(good.resolve())
+    assert _reuse_file(root, "a.png", "image") == str(png.resolve())
+    assert _reuse_file(root, str(outside), "mesh") is None          # absolute path
+    assert _reuse_file(root, "../secret.glb", "mesh") is None       # escapes the run folder
+    assert _reuse_file(root, "parts/leaky.glb", "mesh") is None     # external buffer reference
+    assert _reuse_file(root, "notes.png", "image") is None          # not really an image
+    assert _reuse_file(root, {"x": 1}, "mesh") is None
