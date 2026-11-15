@@ -41,7 +41,24 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 
 All of them use native ComfyUI nodes; no custom nodes are installed.
 
-<!-- MEASURED -->
+### Measured on an RTX 3080 Ti (2026-11-15)
+
+Measured through the MCP server over stdio, with all models in one backend session. Peak VRAM is the whole card: about 3.6 GB of it is the desktop and other applications. ComfyUI streams weights to fit, and no run hit an out of memory error.
+
+| Job | Settings | Time (execution, total) | Peak VRAM |
+|---|---|---|---|
+| Image, cold start (process start + model load) | Z-Image Turbo 1024x1024, 8 steps | 66 s, 73 s | 11.5 GB |
+| Image burst, `count=4`, warm | same | 8.4, 7.6, 7.7, 7.6 s per image; 33 s total | 11.8 GB |
+| Image edit, one reference, first load | Klein 4B, 4 steps, 1024x1024 | 42 s | 11.7 GB |
+| Image edit, warm | same | 6 s | 11.5 GB |
+| Video, text to video | Wan 2.2 5B, 832x480, 49 frames (2.0 s at 24 fps), 20 steps | 85 s | 11.8 GB |
+| Video, defaults, cold start | Wan 2.2 5B, 1280x704, 49 frames, 20 steps | 168 s, 174 s | 11.8 GB |
+| Video, image to video, warm | same, 33 frames | 30 s | 11.8 GB |
+| Mesh, one image | TRELLIS.2, resolution 1024, 2048 px textures, 300k faces | 76 s (GLB 16.9 MB, 162k vertices) | 11.5 GB |
+| Mesh, four views | Pixal3D multi-view, same settings | 74 s (GLB 17.2 MB, 164k vertices) | 11.3 GB |
+| Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
+
+Times include the model swap when the previous job used a different model.
 
 ## Install or rebuild
 
