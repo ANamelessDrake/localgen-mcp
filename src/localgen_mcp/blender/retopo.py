@@ -452,9 +452,12 @@ for img in imgs.values():
     img.pack()
 
 
-def uv_texel_error(lod, base):
-    """How far each LOD triangle's UVs sit from the base mesh's UVs at the nearest point of its surface,
-    in texels. A shared layout gives a few texels; a broken seam or a different unwrap gives hundreds."""
+def texture_fit(lod, base, colour):
+    """How well a LOD maps the shared textures, at the centre of each of its triangles, against the nearest
+    point of the base mesh (LOD0): the UV distance in texels, and whether the base colour read there
+    differs by more than 40 of 255 in any channel. A shared layout gives a median of a few texels; a
+    different unwrap gives hundreds. The tail is larger than the median says: a centre near a UV seam
+    can find its nearest LOD0 point across the seam, on another island, while the colour still agrees."""
     from mathutils.bvhtree import BVHTree
     from mathutils.geometry import barycentric_transform
     base.data.calc_loop_triangles()
@@ -464,17 +467,24 @@ def uv_texel_error(lod, base):
     tree = BVHTree.FromPolygons(bco, [t.vertices[:] for t in btris])
     buv, luv = base.data.uv_layers.active.data, lod.data.uv_layers.active.data
     lco = lod.data.vertices
-    errors = []
+    h, w = colour.shape[:2]
+
+    def texel(uv):
+        return colour[int(uv[1] % 1.0 * h) % h, int(uv[0] % 1.0 * w) % w]
+
+    drift, mismatch = [], 0
     for t in lod.data.loop_triangles:
         p = (lco[t.vertices[0]].co + lco[t.vertices[1]].co + lco[t.vertices[2]].co) / 3
         uv = (luv[t.loops[0]].uv + luv[t.loops[1]].uv + luv[t.loops[2]].uv) / 3
         loc, _normal, idx, _dist = tree.find_nearest(p)
         bt = btris[idx]
-        at = barycentric_transform(loc, *(bco[i] for i in bt.vertices), *(buv[k].uv.to_3d() for k in bt.loops))
-        errors.append((at.xy - uv).length * tex_size)
-    errors = np.array(errors)
-    return {"median": round(float(np.median(errors)), 2), "p95": round(float(np.percentile(errors, 95)), 2),
-            "share_over_8_texels": round(float((errors > 8).mean()), 4)}
+        at = barycentric_transform(loc, *(bco[i] for i in bt.vertices), *(buv[k].uv.to_3d() for k in bt.loops)).xy
+        drift.append((at - uv).length * tex_size)
+        mismatch += int(np.abs(texel(at) - texel(uv)).max() > 40 / 255)
+    drift = np.array(drift)
+    return {"uv_drift_texels_median": round(float(np.median(drift)), 2),
+            "uv_drift_texels_p90": round(float(np.percentile(drift, 90)), 2),
+            "colour_mismatch_share": round(mismatch / max(len(drift), 1), 4)}
 
 
 def lod_candidate(name, weights):
@@ -509,6 +519,9 @@ if lod_faces:
     if high_weights is not None:
         tree = high_tree()
         lod_weights = np.array([high_weights[tree.find(v.co)[1]] for v in low.data.vertices])
+    base_colour = np.empty(len(imgs["base_color"].pixels), dtype=np.float32)
+    imgs["base_color"].pixels.foreach_get(base_colour)
+    base_colour = base_colour.reshape(tex_size, tex_size, -1)[:, :, :3]
     report["lods"] = [{"name": low.name, "faces": len(low.data.polygons), "triangles": lod0_tris,
                        "vertices": len(low.data.vertices)}]
     for i, faces in enumerate(lod_faces[1:], 1):
@@ -520,7 +533,7 @@ if lod_faces:
         else:
             obj = search_ratio(make, lod0_tris, faces)
         entry.update(faces=len(obj.data.polygons), triangles=triangles(obj), vertices=len(obj.data.vertices),
-                     uv_texel_error=uv_texel_error(obj, low))
+                     texture_fit=texture_fit(obj, low, base_colour))
         if lod_weights is not None:
             entry["share_of_faces_in_detailed_areas"] = detail_face_share(obj, high_weights)
         report["lods"].append(entry)

@@ -235,7 +235,8 @@ def test_lod_chain_shares_one_uv_layout_and_material(settings, tmp_path, method)
     assert abs(report["output_faces"] - 1500) <= 0.1 * 1500  # LOD0 is the retopology itself
     for entry, budget in zip(report["lods"][1:], lods[1:]):
         assert abs(entry["triangles"] - budget) <= 0.05 * budget, entry
-        assert entry["uv_texel_error"]["p95"] < 8, entry  # LOD0's layout, not a new one
+        fit = entry["texture_fit"]  # LOD0's layout, not a new one (a fresh unwrap measures about 100)
+        assert fit["uv_drift_texels_median"] < 3 and fit["colour_mismatch_share"] < 0.02, entry
     # LOD0 keeps the base colour bake (the single output's colour check still holds)
     baked = report["base_color_median"]["baked"]
     assert all(abs(b - s) <= 6 for b, s in zip(baked, (200, 60, 30))), baked
@@ -256,7 +257,7 @@ def test_lod_chain_shares_one_uv_layout_and_material(settings, tmp_path, method)
         assert sorted(objs) == names, seen
         assert seen["materials"] == ["retopo"] and all(o["materials"] == ["retopo"] for o in objs.values())
         for name in names[1:]:
-            assert objs[name]["uv_error_p95"] * 256 < 8, (path.suffix, objs[name])
+            assert objs[name]["uv_error_median"] * 256 < 3, (path.suffix, objs[name])
         if path == fbx and method == "quad":
             assert objs[names[0]]["faces"] == report["lods"][0]["faces"]  # LOD0 keeps its quads
 
@@ -267,7 +268,8 @@ def test_lods_follow_the_painted_detail_map(settings, tmp_path):
     subprocess.run([BLENDER, "-b", "--factory-startup", "-P", str(HERE / "blender_make_painted.py"), "--", str(src)],
                    check=True, capture_output=True, timeout=300)
     report = asyncio.run(retopo.retopologize(settings, str(src), 0, "decimate", 256, str(tmp_path / "p"),
-                                             detail="paint", lods=[1500, 600]))
-    lod1 = report["lods"][1]
-    # Half the surface is painted white; a uniform LOD would put about half its faces there.
-    assert lod1["share_of_faces_in_detailed_areas"] > 0.6, lod1
+                                             detail="paint", lods=[3000, 1000, 300]))
+    # Half the surface is painted white. LOD0 puts about 0.9 of its faces there; a uniform decimation
+    # of LOD0 drifts back toward a half (measured 0.78 and 0.63), the weighted one holds (0.91, 0.81).
+    shares = [e["share_of_faces_in_detailed_areas"] for e in report["lods"][1:]]
+    assert shares[0] > 0.85 and shares[1] > 0.72, shares

@@ -266,8 +266,10 @@ async def retopologize_mesh(
     same textures and one material. Entries must be strictly decreasing (1 to 8 of them). Output:
     <name>_retopo_<method>_lods_<budgets>.glb and .fbx holding objects <name>_LOD0, <name>_LOD1, ...
     (Unity's FBX importer builds a LOD Group from that suffix). The report's "lods" lists each LOD's
-    face and triangle counts and uv_texel_error (how far its UVs sit from LOD0's, in texels; a few at
-    most is right). With method "decimate", the detail map also steers the LOD decimations.
+    face and triangle counts and texture_fit: uv_drift_texels_median (how far its UVs sit from LOD0's
+    at the same place; a few texels is right, hundreds means broken mapping) and colour_mismatch_share
+    (share of its triangles whose base colour differs from LOD0's there; it grows as small features
+    collapse). With method "decimate", the detail map also steers the LOD decimations.
     """
     return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir,
                                      detail, detail_strength, lods)
