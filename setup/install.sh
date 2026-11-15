@@ -4,7 +4,11 @@
 # log, output, temp and cache directories, and (unless skipped) the model weights.
 #
 #   setup/install.sh [--root /ai] [--cuda cu130] [--skip-models] [--only image|video|mesh ...]
-#                    [--model-file TARGET ...] [--dry-run]
+#                    [--model-file TARGET ...] [--with-tts] [--dry-run]
+#
+# --with-tts also builds the optional text to speech venv (<root>/venvs/localgen-tts, CPU
+# only, from setup/tts-requirements.lock) and downloads the Kokoro-82M weights in
+# setup/tts.manifest to <root>/models/tts (--skip-models skips those weights too).
 #
 # Idempotent: every step checks what is already there and only does what is
 # missing. --dry-run prints the plan and changes nothing.
@@ -26,6 +30,7 @@ ROOT="${LOCALGEN_ROOT:-/ai}"
 CUDA=""
 DRY=0
 SKIP_MODELS=0
+WITH_TTS=0
 MODEL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,7 +40,8 @@ while [[ $# -gt 0 ]]; do
         --only) MODEL_ARGS+=(--only "$2"); shift 2 ;;
         --model-file) MODEL_ARGS+=(--file "$2"); shift 2 ;;
         --dry-run) DRY=1; shift ;;
-        -h|--help) sed -n 2,14p "$0"; exit 0 ;;
+        --with-tts) WITH_TTS=1; shift ;;
+        -h|--help) sed -n 2,19p "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -43,6 +49,7 @@ ROOT="$(realpath -m "$ROOT")"
 COMFY_DIR="$ROOT/ComfyUI"
 COMFY_VENV="$COMFY_DIR/.venv"
 MCP_VENV="$ROOT/venvs/localgen-mcp"
+TTS_VENV="$ROOT/venvs/localgen-tts"
 
 export UV_CACHE_DIR="$ROOT/.cache/uv"
 export UV_PYTHON_INSTALL_DIR="$ROOT/.cache/uv-python"
@@ -173,6 +180,32 @@ elif (( DRY )); then
     "$HERE/download-models.sh" --root "$ROOT" --dry-run "${MODEL_ARGS[@]}" | sed 's/^/  /'
 else
     run "$HERE/download-models.sh" --root "$ROOT" "${MODEL_ARGS[@]}"
+fi
+
+# -- text to speech (optional) --------------------------------------------
+
+step "Text to speech (--with-tts)"
+if (( ! WITH_TTS )); then
+    say "  skipped (rerun with --with-tts to add speak and list_voices)"
+else
+    command -v ffmpeg >/dev/null && say "  ok: ffmpeg (effects and OGG output)" \
+        || say "  optional, not found: ffmpeg (effects fall back to numpy; WAV only, no OGG)"
+    if [[ -x "$TTS_VENV/bin/python" ]] && "$TTS_VENV/bin/python" -c "import kokoro, soundfile, en_core_web_sm" 2>/dev/null; then
+        say "  ok: $TTS_VENV imports kokoro $("$TTS_VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("kokoro"))')"
+    else
+        [[ -x "$TTS_VENV/bin/python" ]] || run uv venv --python "$PYTHON_VERSION" "$TTS_VENV"
+        # CPU only torch; the lock carries its index URLs and every hash.
+        run uv pip install --python "$TTS_VENV/bin/python" --require-hashes --index-strategy unsafe-best-match \
+            -r "$HERE/tts-requirements.lock"
+    fi
+    if (( SKIP_MODELS )); then
+        say "  weights skipped (--skip-models); fetch them later with:"
+        say "    python3 setup/download_models.py --models-dir $ROOT/models/tts --manifest setup/tts.manifest"
+    elif (( DRY )); then
+        python3 "$HERE/download_models.py" --models-dir "$ROOT/models/tts" --manifest "$HERE/tts.manifest" --dry-run | sed 's/^/  /'
+    else
+        run python3 "$HERE/download_models.py" --models-dir "$ROOT/models/tts" --manifest "$HERE/tts.manifest"
+    fi
 fi
 
 step "Done"

@@ -122,6 +122,71 @@ Files that would be pinned (revision `75aad8836271cb5a5123fb58304fae5d3bb4b0f9` 
 
 Sources: https://huggingface.co/Comfy-Org/stable-audio-3 , https://huggingface.co/stabilityai/stable-audio-3-small-sfx , https://stability.ai/community-license-agreement , https://ai.google.dev/gemma/terms , https://docs.comfy.org/tutorials/audio/stable-audio/stable-audio-3 , https://huggingface.co/OpenSound/EzAudio , https://ai.sony/blog/introducing-woosh-sony-ais-sound-effect-foundation-model , and the Hugging Face API license tags of each repo above (`cvssp/audioldm2`, `declare-lab/tango2`, `HKUSTAudio/AudioX`, `hkchengrex/MMAudio`, `facebook/audiogen-medium`, `Comfy-Org/YuE2`, `Comfy-Org/ACE-Step-1.5`, `ACE-Step/Ace-Step1.5`, `tencent/HunyuanVideo-Foley`, `FunAudioLLM/ThinkSound`).
 
+## Text to speech (added 2026-11-15)
+
+Use: dialogue for the game *A Nameless Rock: Voices in the Dark*, mainly the ship AI PATHFINDER, including "low power" lines where it struggles to speak. Criteria, in order: weights and code both licensed for commercial use, ungated (no login), runs on the CPU (the GPU is shared and usually busy with ComfyUI), good English quality, small. Voice cloning was a nice to have, not a requirement.
+
+Licences were read from each model's Hugging Face card metadata (`cardData.license`, `gated`) through the Hugging Face API on 2026-11-15, and from the project repositories. This is a reading of the stated licences, not legal advice.
+
+| Candidate | Size | Weights licence | Code licence | Notes | Decision |
+|---|---|---|---|---|---|
+| **Kokoro-82M v1.0** (hexgrad) | 82M, 327 MB | Apache 2.0, ungated | Apache 2.0 (`kokoro`, `misaki`) | StyleTTS 2 based, 54 voices (28 English), fast on a CPU, word timestamps | **Chosen** |
+| Chatterbox, Chatterbox Turbo, Multilingual (Resemble AI) | 0.5B, 350M | MIT, ungated | MIT | Zero shot voice cloning and an exaggeration control. Every output carries Resemble's PerTh neural watermark. The README says that as of August 2026 it is "retired research and is no longer maintained" | Not chosen: unmaintained, slow on a CPU, watermarked output. The upgrade path if cloning one reference voice for PATHFINDER is wanted |
+| Kitten TTS mini 0.8 / nano (KittenML) | 80M / 15M | Apache 2.0, ungated | Apache 2.0 | CPU first, a handful of voices. The project has since moved on to a larger KittenTTS 2 with voice cloning (not reviewed) | Not chosen: fewer voices; a reasonable CPU alternative (not compared by listening) |
+| Phonon 31m English (Gradium, released 2026-10-20) | 31M, 65 MB q8 GGUF | Apache 2.0, ungated (the 31m English model only; the 40m models are CC BY-NC 4.0) | runtime `ptts` | Built on Kyutai's Pocket TTS and the Mimi codec; streams, CPU friendly; no cloning in the open weights | Not chosen: a month old, new runtime. Worth a listening test later |
+| Piper (Rhasspy, now OHF-Voice `piper1-gpl`) | 15 to 60 MB per voice | per voice: each voice's model card names its dataset licence, and some datasets are non-commercial | the original MIT repo is archived; development continues as GPL-3.0 `piper1-gpl`, which links espeak-ng | Very fast, lower quality | Not chosen: each voice needs its own licence check, and quality is below Kokoro |
+| Qwen3-TTS 12Hz 1.7B (Alibaba Qwen) | 1.7B | Apache 2.0, ungated | Apache 2.0 | Voice cloning and voice design, multilingual | Not chosen: sized for a GPU; on the shared card it would compete with ComfyUI. A candidate if cloning on the GPU is wanted |
+| VoxCPM 1.5 / VoxCPM2 (OpenBMB) | 0.8B / 2B | Apache 2.0, ungated | Apache 2.0 | Cloning, 48 kHz | Not chosen: GPU sized |
+| CosyVoice 2 / Fun-CosyVoice 3 0.5B (FunAudioLLM) | 0.5B | Apache 2.0, ungated | Apache 2.0 | Cloning, multilingual | Not chosen: heavier stack, GPU oriented |
+| Dia 1.6B, Dia2 2B (Nari Labs) | 1.6B / 2B | Apache 2.0, ungated | Apache 2.0 | Dialogue with non-verbal sounds | Not chosen: GPU sized |
+| Zonos v0.1 (Zyphra) | 1.6B | Apache 2.0, ungated | Apache 2.0 | Uses espeak-ng; the hybrid model needs CUDA kernels | Not chosen: GPU sized |
+| Kyutai TTS 1.6B | 1.6B | CC BY 4.0, ungated (commercial use allowed with attribution) | Apache 2.0 | Streaming | Not chosen: GPU sized; attribution required |
+| Kyutai Pocket TTS | small | CC BY 4.0 | MIT | CPU friendly | Excluded: gated on Hugging Face (needs a login) |
+| Orpheus 3B (Canopy Labs) | 3B | card says Apache 2.0, but it is a Llama 3.2 fine tune, so the Llama 3.2 Community License also applies; gated | Apache 2.0 | | Excluded: gated, Llama licence, GPU sized |
+| Sesame CSM-1B | 1B | Apache 2.0 card, Llama backbone; gated | Apache 2.0 | | Excluded: gated |
+| NeuTTS Air (Neuphonic) | 0.7B | Apache 2.0; gated | Apache 2.0 | CPU cloning | Excluded: gated |
+| VibeVoice 1.5B / Realtime 0.5B (Microsoft) | 1.5B / 0.5B | MIT, ungated | MIT | Long form, multi speaker | Not chosen: GPU oriented, aimed at podcasts |
+| F5-TTS | 0.3B | CC BY-NC 4.0 | MIT | | Excluded: non-commercial weights |
+| XTTS v2 (Coqui) | 0.5B | Coqui Public Model License (non-commercial); Coqui has shut down, so no commercial licence can be bought | MPL 2.0 | | Excluded |
+| Voxtral 4B TTS (Mistral, 2026-03) | 4B | CC BY-NC 4.0 | | | Excluded: non-commercial |
+| IndexTTS-2 (bilibili) | | custom licence (none in the card metadata) | | | Excluded: licence not clear |
+| OpenAudio S1 mini (Fish Audio), Higgs Audio v2 (Boson AI) | | the API refused anonymous reads (gated); Fish Audio's weights are CC BY-NC-SA | | | Excluded |
+
+Decision: **Kokoro-82M v1.0**, revision `f3ff3571791e39611d31c381e3a41a3af07b4987`, the model, `config.json` and the 28 English voices, 341.9 MB in all, pinned by SHA256 in `setup/tts.manifest`. It is the only candidate that is both clearly licensed for commercial use and ungated, small enough to run on the CPU in a few seconds per line, and mature (its packages have been stable since early 2025). The trade off is no voice cloning: PATHFINDER's voice is one of the stock voices or an average of several, and its character comes from the effects.
+
+### Dependencies of the chosen stack
+
+The text to speech venv (`setup/tts-requirements.lock`, 1.3 GB) holds, among others:
+
+| Package | Licence | How it is used |
+|---|---|---|
+| `kokoro` 0.9.4, `misaki` 0.9.4 | Apache 2.0 | Model and English G2P (grapheme to phoneme) |
+| `torch` 2.14.1+cpu | BSD style (Apache 2.0, BSD, MIT parts) | CPU inference; the CPU only build cannot touch the GPU |
+| `transformers`, `huggingface-hub` | Apache 2.0 | Model code; no downloads at runtime (`HF_HUB_OFFLINE=1`, weights read from `<root>/models/tts`) |
+| `spacy` 3.8, `en_core_web_sm` 3.8.0 | MIT | Part of speech tags for misaki; installed from a pinned wheel so misaki never downloads it |
+| `num2words` | LGPL 2.1 | Numbers to words ("forty"), imported as an unmodified Python library |
+| `phonemizer-fork` 3.3.2 | GPL 3.0 or later | Fallback G2P for words missing from misaki's dictionary |
+| `espeakng-loader` 0.2.4 | MIT wrapper around a bundled `libespeak-ng.so` (espeak-ng, GPL 3.0) | The phonemizer loads this shared library into the runner process with ctypes |
+
+On the GPL parts, plainly: espeak-ng and `phonemizer-fork` are GPL 3.0 and are loaded as libraries into the runner process (a linked use, not a separate program). The GPL governs copying and distributing that software. It does not cover what the program outputs: the generated speech is not a copy or derivative of espeak-ng (it is phonemes turned into audio by an Apache 2.0 model), so the WAV and OGG files can be used in a commercial game without GPL obligations. The obligations would apply only if the text to speech runtime itself were shipped to others (for example bundled in the game to synthesise speech on players' machines): then the combined runtime would have to be distributed under GPL terms. This repository ships only its own MIT source and installs the GPL packages from PyPI on the user's machine. If an all permissive runtime is ever needed, misaki can run without the espeak fallback (`fallback=None`); words outside its dictionary are then skipped.
+
+The Apache 2.0 licence of the Kokoro weights asks for its notice to be kept when the weights are redistributed; generated audio needs no attribution. Kokoro's training data is described by its card as permissive or non-copyrighted audio plus synthetic audio from closed TTS providers; nothing in the licence restricts using the output.
+
+### Effects
+
+Effects are ffmpeg filter graphs built in `src/localgen_mcp/tts/effects.py` (ffmpeg is a separate program; LGPL or GPL depending on the build, used as a command line tool, which places no terms on the audio). Without ffmpeg the runner renders numpy approximations. `glitch` uses Kokoro's word timestamps so stutters land on word onsets.
+
+### Text to speech sources
+
+- Kokoro-82M card and voice grades: https://huggingface.co/hexgrad/Kokoro-82M and its `VOICES.md`; code: https://github.com/hexgrad/kokoro , https://github.com/hexgrad/misaki
+- Chatterbox (archive notice, PerTh watermark): https://github.com/resemble-ai/chatterbox
+- Kitten TTS: https://huggingface.co/KittenML/kitten-tts-mini-0.8
+- Phonon: https://huggingface.co/gradium/phonon-31m-en (family table and licences)
+- Piper: https://github.com/rhasspy/piper (archived) and https://github.com/OHF-Voice/piper1-gpl (GPL-3.0); voices: https://huggingface.co/rhasspy/piper-voices
+- espeak-ng (GPL-3.0): https://github.com/espeak-ng/espeak-ng ; espeakng-loader (MIT): https://github.com/thewh1teagle/espeakng-loader
+- Other cards, read through `https://huggingface.co/api/models/<repo>`: Qwen/Qwen3-TTS-12Hz-1.7B-Base, openbmb/VoxCPM2, FunAudioLLM/Fun-CosyVoice3-0.5B-2512, nari-labs/Dia2-2B, Zyphra/Zonos-v0.1-transformer, kyutai/tts-1.6b-en_fr, kyutai/pocket-tts, canopylabs/orpheus-3b-0.1-ft, sesame/csm-1b, neuphonic/neutts-air, microsoft/VibeVoice-1.5B, SWivid/F5-TTS, coqui/XTTS-v2, mistralai/Voxtral-4B-TTS-2603, IndexTeam/IndexTTS-2
+- Survey articles used to find candidates (secondary): https://findskill.ai/blog/best-open-source-tts-2026/ , https://efeanidi.com/articles/phonon-tts/
+
 ## Sources
 
 - Wan 2.2 TI2V 5B model card: https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B
