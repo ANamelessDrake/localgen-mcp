@@ -21,8 +21,8 @@ from mcp.client.stdio import stdio_client
 
 
 async def run(tool: str | None, args: dict, list_tools: bool) -> int:
-    # The MCP SDK passes the server only a few safe variables by default; forward the whole
-    # environment so PYTHONPATH (to test a checkout) and LOCALGEN_* settings reach it.
+    # Pass this environment on (the SDK otherwise keeps only HOME, PATH and a few more), so
+    # PYTHONPATH and LOCALGEN_* settings reach the server, as an MCP client config's "env" block does.
     params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"], env=dict(os.environ))
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
