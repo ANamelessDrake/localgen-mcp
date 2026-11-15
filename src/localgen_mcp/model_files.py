@@ -58,6 +58,20 @@ def is_gltf(path: Path) -> bool:
         return f.read(4) == b"glTF"
 
 
+def input_glb(input_mesh: str) -> Path:
+    """A caller's GLB path, resolved: it must exist, be named .glb, carry the binary glTF signature and
+    embed every buffer and image."""
+    path = Path(input_mesh).expanduser().resolve()
+    if not path.is_file():
+        raise ModelFileError(f"mesh not found: {path}")
+    with open(path, "rb") as f:
+        signature = f.read(4)
+    if path.suffix.lower() != ".glb" or signature != b"glTF":
+        raise ModelFileError(f"not a binary glTF (.glb) file: {path}")
+    require_self_contained(path)
+    return path
+
+
 def require_self_contained(path: Path) -> None:
     """Raise unless a glTF/GLB embeds every buffer and image. Other formats are not checked here."""
     if is_gltf(path):
