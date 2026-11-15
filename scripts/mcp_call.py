@@ -17,13 +17,15 @@ import sys
 import time
 
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 
 
 async def run(tool: str | None, args: dict, list_tools: bool) -> int:
-    # Pass this environment on (the SDK otherwise keeps only HOME, PATH and a few more), so
-    # PYTHONPATH and LOCALGEN_* settings reach the server, as an MCP client config's "env" block does.
-    params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"], env=dict(os.environ))
+    # The MCP client hands the server only a minimal environment (HOME, PATH, ...); pass PYTHONPATH and the
+    # LOCALGEN_* settings through, so a checkout run with PYTHONPATH=src tests its own code and settings.
+    env = {**get_default_environment(),
+           **{k: v for k, v in os.environ.items() if k == "PYTHONPATH" or k.startswith("LOCALGEN_")}}
+    params = StdioServerParameters(command=sys.executable, args=["-m", "localgen_mcp.server"], env=env)
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()

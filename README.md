@@ -17,6 +17,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). `lods` adds a LOD chain sharing one texture set. Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces` or `retopo_lods`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
+| `rig_creature` | Soft rig for an organic creature: bone chains (`chain` for tentacles, tails and vines; `spine`; `wings` for rays and other flat flyers; `auto` picks) with smooth skin weights, at most 4 per vertex, so engine scripts or physics can bend it. Writes a GLB and an FBX. Headless Blender on the CPU, a few seconds. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -79,6 +80,23 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
+### Soft rigs for creatures
+
+`rig_creature` rigs organic meshes for deformation driven in the engine (shaders, Verlet chains, springs); it makes no animation clips. Run it on a `retopologize_mesh` result: raw generated meshes are heavy and full of stray shells.
+- **Presets.**
+  - `chain`: `bones` (default 8) along the main axis or a given `axis`, rooted at `root_end` (default: the lower end of a vertical chain, else the thicker end). Joints are slice centroids, so the chain follows a gently curved mesh.
+  - `spine`: the same along a body.
+  - `wings`: the thin axis is the surface normal, and the left-right axis is the one the mesh is mirror symmetric across. A spine runs down the middle, and `wing_chains` chains of `wing_bones` bones fan out on each side to the wing edge.
+  - `auto`: picks from the proportions and reports why.
+- **Names.** `tentacle_01` (or `<name>_01`), `spine_01`, `wing_L1_01` and the mirrored `wing_R1_01`, numbered from the root and, for wing chains, from the head. Every bone's local Y runs along it; rotating about local X bends it (for wings, towards the surface normal: a flap).
+- **Weights.** Blender's heat weights first. They often fail on generated meshes: on the test manta, a spine rig left 100% of the vertices unweighted ("failed to find solution"). When more than 1% of the vertices are unweighted, or weighted mainly to a bone more than twice as far as their nearest, all weights are replaced by a smooth inverse distance falloff from the bone segments; a smaller share is patched. Vertices at the same position (split at UV seams) get the same weights, then each vertex keeps its 4 largest, normalised. The report gives the method, the heat failure shares, coverage and influences per vertex.
+- **Output.** A GLB and an FBX in the rest pose, and a report of every bone (head, tail, parent).
+- `scripts/render_glb_views.py ... --pose 'wing_.*=12'` renders a rig posed, framed like the rest pose, for before and after stills.
+- **Limits.**
+  - Joints come from straight slices, so a tentacle curled through more than about 90 degrees gets a chain that cuts the curve. Give it a straighter mesh or split it.
+  - Distance weights are Euclidean, so parts that touch without being connected (a tentacle curled against the body) pull on each other.
+  - On `wings`, the body is a fixed strip (12% of the half span each side of the middle). Anything outside it, such as a manta's head lobes, moves with the nearest wing chain.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -117,6 +135,7 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
+| Soft rig (`rig_creature`) | 8k quad manta, `wings`, 30 bones | 2 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 

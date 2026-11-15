@@ -19,6 +19,7 @@ parented rigidly to its bone, so posing a bone moves exactly that part.
 The last stdout line is a JSON report starting with "ASSEMBLE_RESULT ".
 """
 import json
+import os
 import sys
 
 import bpy
@@ -26,41 +27,16 @@ import numpy as np
 from mathutils import Matrix, Vector
 from mathutils.kdtree import KDTree
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _bpy_util  # noqa: E402
+
 spec = json.load(open(sys.argv[sys.argv.index("--") + 1]))
 report = {"parts": {}, "warnings": []}
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
 
-def import_glb(path, name):
-    before = set(bpy.data.objects)
-    bpy.ops.import_scene.gltf(filepath=path)
-    new = [o for o in bpy.data.objects if o not in before]
-    new_names = [o.name for o in new]
-    meshes = [o for o in new if o.type == "MESH"]
-    bpy.ops.object.select_all(action="DESELECT")
-    for o in meshes:
-        o.select_set(True)
-    bpy.context.view_layer.objects.active = meshes[0]
-    if len(meshes) > 1:
-        bpy.ops.object.join()
-    obj = bpy.context.view_layer.objects.active
-    bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    for n in new_names:  # empties and other leftovers (joined meshes are already gone)
-        o = bpy.data.objects.get(n)
-        if o is not None and o != obj:
-            bpy.data.objects.remove(o, do_unlink=True)
-    obj.name = name
-    return obj
-
-
-def verts(obj):
-    co = np.empty(len(obj.data.vertices) * 3, dtype=np.float64)
-    obj.data.vertices.foreach_get("co", co)
-    co = co.reshape(-1, 3)
-    mw = np.array(obj.matrix_world)
-    return co @ mw[:3, :3].T + mw[:3, 3]
+import_glb, verts = _bpy_util.import_glb, _bpy_util.verts
 
 
 def silhouette_box(path):
@@ -236,12 +212,6 @@ for n in names:
                                         [round(float(c), 4) for c in v.max(axis=0)]]})
 report["root"] = root
 
-bpy.ops.object.select_all(action="DESELECT")
-for o in objects:
-    o.select_set(True)
-bpy.ops.export_scene.gltf(filepath=spec["out_glb"], export_format="GLB", use_selection=True,
-                          export_image_format="AUTO", export_animations=False)
-bpy.ops.export_scene.fbx(filepath=spec["out_fbx"], use_selection=True, path_mode="COPY", embed_textures=True,
-                         add_leaf_bones=False, bake_anim=False, apply_scale_options="FBX_SCALE_ALL")
+_bpy_util.export_glb_fbx(objects, spec["out_glb"], spec["out_fbx"])
 report["glb"], report["fbx"] = spec["out_glb"], spec["out_fbx"]
 print("ASSEMBLE_RESULT " + json.dumps(report), flush=True)
