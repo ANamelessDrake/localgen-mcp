@@ -171,6 +171,7 @@ async def generate_mesh(
     framing: str = "crop",
     retopo_faces: int | None = None,
     retopo_method: str = "quad",
+    retopo_lods: list[int] | None = None,
     seed: int | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
@@ -190,12 +191,14 @@ async def generate_mesh(
     scale for all views, as from a 3D render rig at 20 degrees horizontal FOV).
     remove_background=False uses the image's own alpha channel instead of BiRefNet.
     retopo_faces (for example 10000): also make a game weight copy with retopologize_mesh
-    (retopo_method "quad" or "decimate"); the result's "retopo" entry has its path. For a plain
+    (retopo_method "quad" or "decimate"); the result's "retopo" entry has its path. retopo_lods (for
+    example [10000, 3000, 800]) makes a LOD chain instead, as retopologize_mesh's lods. For a plain
     triangle mesh at a given size, face_count alone does it inside the generation.
     Returns the GLB path, the reference image path when one was generated, seed, settings and timings.
     """
     if not input_image and not prompt:
         raise ValueError("give input_image or prompt")
+    retopo.validate_lods(retopo_lods)  # before the GPU work, not after it
     side_views = {"left": left_image, "back": back_image, "right": right_image}
     side_views = {k: v for k, v in side_views.items() if v}
     if side_views and not input_image:
@@ -223,9 +226,10 @@ async def generate_mesh(
     if reference is not None:
         result["reference_image"] = reference["paths"][0]
         result["reference_image_seconds"] = reference["total_seconds"]
-    if retopo_faces:
-        result["retopo"] = await retopo.retopologize(settings, result["paths"][0], retopo_faces,
-                                                     retopo_method, texture_size or 2048, output_dir)
+    if retopo_faces or retopo_lods:
+        result["retopo"] = await retopo.retopologize(settings, result["paths"][0], retopo_faces or 10000,
+                                                     retopo_method, texture_size or 2048, output_dir,
+                                                     lods=retopo_lods)
     return result
 
 
@@ -238,6 +242,7 @@ async def retopologize_mesh(
     output_dir: str | None = None,
     detail: str | None = None,
     detail_strength: float = 1.0,
+    lods: list[int] | None = None,
 ) -> dict:
     """Make a game weight copy of a textured GLB: new topology, new UVs, and baked PBR textures.
 
@@ -255,9 +260,19 @@ async def retopologize_mesh(
     Output: <output_dir or the input's folder>/<name>_retopo_<method>_<faces>.glb, plus an .fbx
     with embedded textures that keeps real quads (glTF stores only triangles).
     Returns the path, face and vertex counts before and after, the method that ran and timings.
+    lods (for example [10000, 3000, 800]): a LOD chain for a game engine instead of one mesh. lods[0]
+    replaces target_faces and is LOD0, the retopology above with its baked textures; each further
+    entry is a triangle budget for a decimation of LOD0 that keeps LOD0's UVs, so every LOD uses the
+    same textures and one material. Entries must be strictly decreasing (1 to 8 of them). Output:
+    <name>_retopo_<method>_lods_<budgets>.glb and .fbx holding objects <name>_LOD0, <name>_LOD1, ...
+    (Unity's FBX importer builds a LOD Group from that suffix). The report's "lods" lists each LOD's
+    face and triangle counts and texture_fit: uv_drift_texels_median (how far its UVs sit from LOD0's
+    at the same place; a few texels is right, hundreds means broken mapping) and colour_mismatch_share
+    (share of its triangles whose base colour differs from LOD0's there; it grows as small features
+    collapse). With method "decimate", the detail map also steers the LOD decimations.
     """
     return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir,
-                                     detail, detail_strength)
+                                     detail, detail_strength, lods)
 
 
 def _reuse_file(root: Path, entry, kind: str) -> str | None:

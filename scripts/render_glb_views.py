@@ -1,6 +1,8 @@
 """Render a GLB from Pixal3D's fixed orbit rig (front, left, back, right).
 
-blender -b -t 8 -P scripts/render_glb_views.py -- in.glb out_prefix [size] [transparent 0|1] [wire 0|1]
+blender -b -t 8 -P scripts/render_glb_views.py -- in.glb out_prefix [size] [transparent 0|1] [wire 0|1] [object]
+
+object: render only the mesh object of that name (for example one LOD of a LOD chain).
 
 The mesh is scaled so its largest bounding box side is 1 and centred at the
 origin, as the rig assumes; cameras follow nodes_trellis2._orbit_camera_to_world
@@ -17,10 +19,18 @@ src, prefix = argv[0], argv[1]
 size = int(argv[2]) if len(argv) > 2 else 512
 transparent = len(argv) > 3 and argv[3] == "1"
 wire = len(argv) > 4 and argv[4] == "1"  # overlay the mesh edges
+only = argv[5] if len(argv) > 5 else ""  # one object's name, for example "robot_LOD2"
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=src)
 meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+if only:
+    for o in meshes:
+        if o.name != only:
+            bpy.data.objects.remove(o, do_unlink=True)
+    meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+    if not meshes:
+        raise SystemExit(f"no mesh object named {only!r} in {src}")
 
 lo = Vector((1e9,) * 3)
 hi = Vector((-1e9,) * 3)
