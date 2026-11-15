@@ -3,7 +3,7 @@
 # ComfyUI at a pinned commit with its own venv, the MCP server venv, the run,
 # log, output, temp and cache directories, and (unless skipped) the model weights.
 #
-#   setup/install.sh [--root /ai] [--cuda cu130] [--skip-models] [--only image|video|mesh ...]
+#   setup/install.sh [--root /ai] [--cuda cu130] [--skip-models] [--only image|video|mesh|upscale ...]
 #                    [--model-file TARGET ...] [--with-tts] [--dry-run]
 #
 # --with-tts also builds the optional text to speech venv (<root>/venvs/localgen-tts, CPU

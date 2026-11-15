@@ -9,6 +9,9 @@ is moved into place.
 Standard library only, so it runs before any venv exists.
 
     download_models.py --models-dir /ai/ComfyUI/models [--only video] [--dry-run] [--verify]
+
+Files come from Hugging Face at a pinned revision, or (repo "github:owner/name")
+from a GitHub release asset, pinned by its SHA256.
 """
 from __future__ import annotations
 
@@ -24,6 +27,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = HERE / "models.manifest"
 CHUNK = 8 * 1024 * 1024
+GROUPS = ("image", "video", "mesh", "tts", "upscale")
+# repo "github:<owner>/<name>" fetches a release asset instead of a Hugging Face file,
+# for weights that are only published as GitHub releases.
+GITHUB_PREFIX = "github:"
 
 
 @dataclass(frozen=True)
@@ -37,7 +44,16 @@ class Entry:
     sha256: str
 
     @property
+    def is_github(self) -> bool:
+        return self.repo.startswith(GITHUB_PREFIX)
+
+    @property
     def url(self) -> str:
+        if self.is_github:
+            # A GitHub release asset: revision is the release tag, path the asset name. Tags can be
+            # moved, so the SHA256 check below is what pins the content.
+            return (f"https://github.com/{self.repo[len(GITHUB_PREFIX):]}/releases/download/"
+                    f"{self.revision}/{self.path}")
         return f"https://huggingface.co/{self.repo}/resolve/{self.revision}/{self.path}"
 
 
@@ -51,6 +67,12 @@ def read_manifest(path: Path) -> list[Entry]:
         if len(parts) != 7:
             raise SystemExit(f"{path}:{lineno}: expected 7 fields, got {len(parts)}")
         g, target, repo, rev, p, size, sha = parts
+        if g not in GROUPS:
+            raise SystemExit(f"{path}:{lineno}: unknown group {g!r}; expected one of {GROUPS}")
+        if repo.startswith(GITHUB_PREFIX) and repo[len(GITHUB_PREFIX):].count("/") != 1:
+            raise SystemExit(f"{path}:{lineno}: a GitHub source is github:<owner>/<repo>, got {repo!r}")
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha.lower()):
+            raise SystemExit(f"{path}:{lineno}: sha256 must be 64 hex digits")
         entries.append(Entry(g, target, repo, rev, p, int(size), sha.lower()))
     return entries
 
@@ -80,7 +102,7 @@ def download(entry: Entry, dest: Path) -> None:
         have = 0
     headers = {"User-Agent": "localgen-mcp-setup"}
     token = os.environ.get("HF_TOKEN")
-    if token:
+    if token and not entry.is_github:  # never send the Hugging Face token to another host
         headers["Authorization"] = f"Bearer {token}"
     if have:
         headers["Range"] = f"bytes={have}-"
@@ -116,7 +138,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models-dir", required=True, type=Path, help="ComfyUI models directory")
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    ap.add_argument("--only", action="append", choices=["image", "video", "mesh", "tts"],
+    ap.add_argument("--only", action="append", choices=list(GROUPS),
                     help="limit to a group (repeatable); default all groups")
     ap.add_argument("--file", action="append", default=[], metavar="TARGET",
                     help="limit to manifest targets containing this text (repeatable), for example vae/ae")

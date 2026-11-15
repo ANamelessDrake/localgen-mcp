@@ -187,6 +187,30 @@ Effects are ffmpeg filter graphs built in `src/localgen_mcp/tts/effects.py` (ffm
 - Other cards, read through `https://huggingface.co/api/models/<repo>`: Qwen/Qwen3-TTS-12Hz-1.7B-Base, openbmb/VoxCPM2, FunAudioLLM/Fun-CosyVoice3-0.5B-2512, nari-labs/Dia2-2B, Zyphra/Zonos-v0.1-transformer, kyutai/tts-1.6b-en_fr, kyutai/pocket-tts, canopylabs/orpheus-3b-0.1-ft, sesame/csm-1b, neuphonic/neutts-air, microsoft/VibeVoice-1.5B, SWivid/F5-TTS, coqui/XTTS-v2, mistralai/Voxtral-4B-TTS-2603, IndexTeam/IndexTTS-2
 - Survey articles used to find candidates (secondary): https://findskill.ai/blog/best-open-source-tts-2026/ , https://efeanidi.com/articles/phonon-tts/
 
+## Upscaling (added 2026-11-15)
+
+For `upscale_image`: 2x and 4x upscaling of concept art and game textures. The game is commercial, so only weights whose license allows commercial use qualify. Upscale models are small (tens to hundreds of MB), run through ComfyUI's native `UpscaleModelLoader` and `ImageUpscaleWithModel` (spandrel 0.4.2 in the ComfyUI venv), and tile internally, so VRAM is not a constraint. The license is the deciding criterion. Licenses below are as stated by each project's repo or release page, cross-checked against the OpenModelDB catalogue (data repo at commit `5a35f802`, 2026-11-08), which has a license field for all 672 models it lists.
+
+| Candidate | Arch, size | Weights license | Decision |
+|---|---|---|---|
+| **Real-ESRGAN x4plus** (xinntao) | ESRGAN, 67 MB | BSD-3-Clause (the repo's license; the weights are released in the same repo with no separate terms) | **Added as the default.** The established general purpose real world upscaler; handles noise, blur and JPEG artefacts. Only published as a GitHub release asset (v0.1.0) |
+| **4x-PBRify UpscalerV4** (Kim2091) | DAT2, 140 MB | CC0-1.0 (stated on the release; the PBRify_Remix project says its models were trained only on CC0 textures from ambientCG) | **Added for textures** (`model="pbrify-v4"`). Made for game textures, released 2025-05. The cleanest license of any candidate: CC0 weights and CC0 training data |
+| Real-ESRGAN x4plus anime 6B | ESRGAN 6 blocks, 18 MB | BSD-3-Clause | Not added. Tuned for anime line art and flat colour; the concept art here is painted or rendered. Easy to add (same release scheme) if needed |
+| Real-ESRGAN x2plus | ESRGAN, 67 MB | BSD-3-Clause | Not added: 2x is made by downscaling the 4x result instead, so one model covers both scales |
+| 4x-UltraSharp, 4x-UltraSharpV2 (Kim2091) | ESRGAN, DAT2 | CC BY-NC-SA 4.0 | Excluded: non-commercial |
+| 4x-AnimeSharp, 2x-AnimeSharpV4, 2x-GameUpV2, StarSample V2 and most community models | various | CC BY-NC-SA 4.0 (227 of the 672 OpenModelDB entries; CC BY-NC is another 53) | Excluded: non-commercial |
+| 4x-TextureDAT2-otf, 4x-Nomos2 series (Phhofm) | DAT2 and others | CC BY 4.0 | Allowed commercially with attribution, but PBRify V4 covers textures under CC0 with a stated CC0 training set |
+| Swin2SR (mv-lab) | Swin V2 | Apache-2.0 | Not added: a research model for compressed image restoration, trained on synthetic bicubic and JPEG degradations of DIV2K and Flickr2K; Real-ESRGAN covers general use |
+| HAT, HAT-L (XPixelGroup) | HAT, 166 MB | Apache-2.0 per OpenModelDB and a Hugging Face mirror; originals are on Google Drive, which cannot be pinned | Not added: bicubic-trained research model, slow, unpinnable source |
+| DAT (zhengchen1999) | DAT, 155 MB | Apache-2.0 | Not added: bicubic-trained research model; PBRify V4 is a DAT2 fine-tune for this use |
+| Newer models (2025 to 2026) in OpenModelDB | | | Every 2x or 4x general model added in 2026 (StarSample V2, 2x-Adore) is CC BY-NC-SA. The permissive ones (2x-90s-Sonic, Where-On-Earth, DigitalPokemon, MIT) target retro game footage or pixel art, not concept art |
+
+Caveat on Real-ESRGAN: the BSD-3-Clause license covers the code and the released weights. The model was trained on DF2K (DIV2K and Flickr2K) and OST images, whose own terms were not reviewed here; the license of the weights does not depend on them, but a cautious reviewer may prefer PBRify V4 (CC0 throughout) for shipped assets.
+
+Pinning: neither model is on Hugging Face from its authors (the mirrors there have no stated provenance), so `setup/models.manifest` gained a GitHub release source (`github:<owner>/<repo>`, release tag, asset name) pinned by SHA256, and `download_models.py` never sends a Hugging Face token to GitHub. The Real-ESRGAN `.pth` SHA256 matches OpenModelDB's record. For PBRify the `.safetensors` asset is used rather than the `.pth` (no pickle); its tensors were compared with the `.pth`, whose SHA256 matches OpenModelDB, and are identical. ComfyUI loads `.pth` files with `torch.load(weights_only=True)`. Download: 206.83 MB for both.
+
+Sources: https://github.com/xinntao/Real-ESRGAN (license, releases v0.1.0 and v0.2.2.4), https://github.com/Kim2091/Kim2091-Models/releases/tag/4x-PBRify_UpscalerV4 , https://github.com/Kim2091/PBRify_Remix , https://openmodeldb.info and https://github.com/OpenModelDB/open-model-database (data/models/*.json), https://github.com/mv-lab/swin2sr , https://huggingface.co/Acly/hat .
+
 ## Sources
 
 - Wan 2.2 TI2V 5B model card: https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B

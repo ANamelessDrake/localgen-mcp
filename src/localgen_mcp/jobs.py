@@ -76,6 +76,31 @@ def image_size(path: Path) -> tuple[int, int]:
     raise JobError(f"cannot read the size of {path}; use a PNG or JPEG")
 
 
+def png_has_alpha(path: Path) -> bool:
+    """True when a PNG has an alpha channel (colour type 4 or 6) or a tRNS transparency chunk.
+    JPEG has no alpha; other formats return False."""
+    import struct
+    with open(path, "rb") as f:
+        if f.read(8) != b"\x89PNG\r\n\x1a\n":
+            return False
+        while True:
+            head = f.read(8)
+            if len(head) < 8:
+                return False
+            length, kind = struct.unpack(">I4s", head)
+            if kind == b"IHDR":
+                ihdr = f.read(length)
+                if len(ihdr) >= 10 and ihdr[9] in (4, 6):
+                    return True
+                f.seek(4, 1)  # CRC
+                continue
+            if kind == b"tRNS":
+                return True
+            if kind in (b"IDAT", b"IEND"):  # tRNS must come before the image data
+                return False
+            f.seek(length + 4, 1)
+
+
 def placeholder_png(path: Path) -> Path:
     """An 8x8 black PNG, written once (Load3D wants viewport images even when run headless)."""
     if not path.exists():
