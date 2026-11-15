@@ -3,7 +3,8 @@
 # ComfyUI at a pinned commit with its own venv, the MCP server venv, the run,
 # log, output, temp and cache directories, and (unless skipped) the model weights.
 #
-#   setup/install.sh [--root /ai] [--cuda cu130] [--skip-models] [--only image|video|mesh ...] [--dry-run]
+#   setup/install.sh [--root /ai] [--cuda cu130] [--skip-models] [--only image|video|mesh ...]
+#                    [--model-file TARGET ...] [--dry-run]
 #
 # Idempotent: every step checks what is already there and only does what is
 # missing. --dry-run prints the plan and changes nothing.
@@ -32,8 +33,9 @@ while [[ $# -gt 0 ]]; do
         --cuda) CUDA="$2"; shift 2 ;;
         --skip-models) SKIP_MODELS=1; shift ;;
         --only) MODEL_ARGS+=(--only "$2"); shift 2 ;;
+        --model-file) MODEL_ARGS+=(--file "$2"); shift 2 ;;
         --dry-run) DRY=1; shift ;;
-        -h|--help) sed -n 2,13p "$0"; exit 0 ;;
+        -h|--help) sed -n 2,14p "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done

@@ -38,6 +38,18 @@ def _exec_seconds(entry: dict) -> float | None:
     return round((end - start) / 1000.0, 2)
 
 
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")
+
+
+def is_image_file(path: Path) -> bool:
+    """True when the file starts with a known image signature (checked by content, not extension)."""
+    with open(path, "rb") as f:
+        head = f.read(16)
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return True
+    return any(head.startswith(m) for m in _IMAGE_MAGIC)
+
+
 def default_output_dir(settings: Settings, modality: str) -> Path:
     return settings.output_dir / modality / dt.date.today().isoformat()
 
@@ -81,6 +93,10 @@ async def run_workflow(
         path = Path(raw).expanduser().resolve()
         if not path.is_file():
             raise JobError(f"input image not found: {path}")
+        if not is_image_file(path):
+            # Uploads land in ComfyUI's input folder, which a LAN-bound manual
+            # instance would serve; only ever copy real images there.
+            raise JobError(f"not a PNG, JPEG, WebP, GIF, BMP or TIFF image: {path}")
         image_paths[slot] = path
     if len(image_paths) < workflow.min_images:
         raise JobError(f"{workflow.name} needs at least {workflow.min_images} input image(s) "

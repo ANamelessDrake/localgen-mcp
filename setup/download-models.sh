@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download the model weights in setup/models.manifest that are missing.
 #
-#   setup/download-models.sh [--root /ai] [--only image|video|mesh] [--dry-run] [--verify]
+#   setup/download-models.sh [--root /ai] [--only image|video|mesh] [--file TARGET] [--dry-run] [--verify]
 #
 # Weights go to <root>/ComfyUI/models. Caches and temp files stay under <root>.
 set -euo pipefail

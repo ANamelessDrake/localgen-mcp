@@ -123,3 +123,15 @@ def test_pixal3d_multiview_feeds_each_view():
     assert g["40"]["inputs"]["unet_name"].startswith("pixal3d_multiview")
     assert "Trellis2Conditioning" not in _classes(g)
     assert _classes(g).count("RemoveBackground") == 2
+
+
+def test_only_real_images_are_uploaded(tmp_path):
+    from localgen_mcp.jobs import is_image_file
+    png = tmp_path / "a.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 32)
+    webp = tmp_path / "b.webp"
+    webp.write_bytes(b"RIFF\x10\0\0\0WEBPVP8 " + b"\0" * 16)
+    secret = tmp_path / "id_rsa.png"  # an image extension does not make it an image
+    secret.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    assert is_image_file(png) and is_image_file(webp)
+    assert not is_image_file(secret)

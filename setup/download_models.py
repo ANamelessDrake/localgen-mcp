@@ -118,11 +118,14 @@ def main() -> int:
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--only", action="append", choices=["image", "video", "mesh"],
                     help="limit to a group (repeatable); default all groups")
+    ap.add_argument("--file", action="append", default=[], metavar="TARGET",
+                    help="limit to manifest targets containing this text (repeatable), for example vae/ae")
     ap.add_argument("--dry-run", action="store_true", help="report what would be downloaded and exit")
     ap.add_argument("--verify", action="store_true", help="also checksum files that are already present")
     a = ap.parse_args()
 
-    entries = [e for e in read_manifest(a.manifest) if not a.only or e.group in a.only]
+    entries = [e for e in read_manifest(a.manifest)
+               if (not a.only or e.group in a.only) and (not a.file or any(f in e.target for f in a.file))]
     missing: list[Entry] = []
     for e in entries:
         dest = a.models_dir / e.target
