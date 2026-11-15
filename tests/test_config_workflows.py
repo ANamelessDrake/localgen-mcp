@@ -244,3 +244,144 @@ def test_part_isolation_crops_then_cleans():
     refs = [n for n in g.values() if n["class_type"] == "ReferenceLatent"]
     scales = {g[r["inputs"]["latent"][0]]["inputs"]["pixels"][0] for r in refs}
     assert {g[s]["inputs"]["image"][0] for s in scales} == {"crop"}
+
+
+# -- image to image and masked editing ----------------------------------------
+
+
+def _node(g, ref):
+    return g[ref[0]]
+
+
+def test_zimage_text_to_image_graph_unchanged_without_input_image():
+    wf = workflows.get("image")
+    g = wf.build(_params(wf, prompt="x"))
+    assert sorted(g, key=int) == [str(i) for i in range(1, 11)]
+    k = g["8"]["inputs"]
+    assert _node(g, k["latent_image"])["class_type"] == "EmptySD3LatentImage" and k["denoise"] == 1
+    assert g["10"]["inputs"]["images"] == ["9", 0]
+
+
+def test_zimage_image_to_image_starts_from_the_encoded_input():
+    wf = workflows.get("image")
+    g = wf.build(_params(wf, prompt="x", denoise=0.3, images={"image": "localgen/in.png"}))
+    _check_graph(g)
+    assert "EmptySD3LatentImage" not in _classes(g) and "SetLatentNoiseMask" not in _classes(g)
+    k = g["8"]["inputs"]
+    assert k["steps"] / int(k["steps"] / k["denoise"]) == pytest.approx(0.3)  # what KSampler really applies
+    enc = _node(g, k["latent_image"])
+    assert enc["class_type"] == "VAEEncode"
+    work = _node(g, enc["inputs"]["pixels"])
+    # any input size: worked on at about 1 MP with both sides a multiple of 16
+    assert work["class_type"] == "ImageScaleToTotalPixels" and work["inputs"]["resolution_steps"] == 16
+    assert _node(g, work["inputs"]["image"])["inputs"]["image"] == "localgen/in.png"
+    # the result goes back to the input's own size
+    restore = _node(g, g["10"]["inputs"]["images"])
+    assert restore["class_type"] == "ResizeImageMaskNode" and restore["inputs"]["input"] == ["9", 0]
+    assert restore["inputs"]["resize_type"] == "match size"
+    assert restore["inputs"]["resize_type.match"] == work["inputs"]["image"]
+    k = wf.build(_params(wf, prompt="x", images={"image": "a.png"}))["8"]["inputs"]
+    assert k["steps"] / int(k["steps"] / k["denoise"]) == pytest.approx(0.6)  # the default
+
+
+def test_partial_denoise_is_honoured_with_few_steps():
+    from localgen_mcp.workflows.image_edit import ksampler_steps, schedule_steps
+    for d in (0.05, 0.1, 0.3, 0.45, 0.6, 0.75, 0.8, 0.9, 0.95, 0.99):
+        steps, passed = ksampler_steps(8, d)
+        total = int(steps / passed)  # KSampler's schedule length
+        assert 8 <= steps < total, d  # never the full schedule, which would ignore the input image
+        assert abs(steps / total - d) <= (0.01 if d <= 0.9 else 0.06), d
+        t, passed = schedule_steps(4, d)  # SplitSigmasDenoise runs round(t * passed) of t
+        run = round(t * passed)
+        assert 0 < run < t and abs(run / t - d) <= 0.07, d
+    assert ksampler_steps(8, 1.0) == (8, 1.0) and schedule_steps(4, 1.0) == (4, 1.0)
+    # with 8 steps KSampler alone would turn 0.9 into a full schedule (int(8 / 0.9) == 8)
+    assert int(8 / 0.9) == 8
+
+
+def _check_masked(g, decoded):
+    """Sampling is limited to the mask, and the decoded result is pasted over the original
+    outside it, with the mask read from the mask image's red channel at the original's size."""
+    original = ["edit_src", 0]
+    assert g["edit_src"]["class_type"] == "LoadImage"
+    comp = _node(g, next(n for n in g.values() if n["class_type"] == "SaveImage")["inputs"]["images"])
+    assert comp["class_type"] == "ImageCompositeMasked"
+    ci = comp["inputs"]
+    assert ci["destination"] == original and ci["source"] == decoded
+    assert ci["resize_source"] is True and (ci["x"], ci["y"]) == (0, 0)
+    # the composite mask: red channel of the mask image (white = change), fitted to the original,
+    # grown, then feathered; never LoadImage's own mask output (1 - alpha)
+    mask = ci["mask"]
+    chain = []
+    while True:
+        node = _node(g, mask)
+        chain.append(node["class_type"])
+        if node["class_type"] == "LoadImage":
+            break
+        mask = node["inputs"].get("mask") or node["inputs"].get("image") or node["inputs"].get("input")
+        assert mask[1] == 0, f"{node['class_type']} reads output {mask[1]}"
+    assert chain == ["ImageToMask", "ImageBlur", "MaskToImage", "GrowMask", "ResizeImageMaskNode", "ImageToMask",
+                     "LoadImage"]
+    assert g["edit_mask_red"]["inputs"]["channel"] == "red"
+    assert g["edit_mask_fit"]["inputs"]["resize_type.match"] == original
+    assert g["edit_mask_grow"]["inputs"]["expand"] > 0
+    noise = next(n for n in g.values() if n["class_type"] == "SetLatentNoiseMask")["inputs"]
+    assert noise["mask"] == ci["mask"] and _node(g, noise["samples"])["class_type"] == "VAEEncode"
+    return noise
+
+
+def test_zimage_masked_edit_composites_back_over_the_original():
+    wf = workflows.get("image")
+    g = wf.build(_params(wf, prompt="x", denoise=0.9, images={"image": "localgen/in.png", "mask": "localgen/m.png"}))
+    _check_graph(g)
+    _check_masked(g, ["9", 0])
+    assert _node(g, g["8"]["inputs"]["latent_image"])["class_type"] == "SetLatentNoiseMask"
+    assert g["edit_mask_load"]["inputs"]["image"] == "localgen/m.png"
+
+
+def test_klein_edits_the_input_image_as_image_one():
+    wf = workflows.get("image", "flux2-klein-4b")
+    g = wf.build(_params(wf, prompt="x", images={"image": "in.png", "mask": "m.png", "ref1": "hat.png"}))
+    _check_graph(g)
+    noise = _check_masked(g, ["decode", 0])
+    assert noise["samples"] == ["init", 0] and g["init"]["inputs"]["pixels"] == ["edit_work", 0]
+    sample = g["sample"]["inputs"]
+    assert sample["latent_image"] == ["noise_mask", 0]
+    assert sample["sigmas"] == ["split", 1] and g["split"]["inputs"]["denoise"] == 1.0
+    # image 1 is the edited image, then the references in order
+    assert g["ref0_scale"]["inputs"]["image"] == ["edit_work", 0]
+    assert g["ref1_scale"]["inputs"]["image"] == ["load0", 0] and g["load0"]["inputs"]["image"] == "hat.png"
+    assert "EmptyFlux2LatentImage" not in _classes(g)
+    assert g["sched"]["inputs"]["width"] == ["size", 0] and g["size"]["inputs"]["image"] == ["edit_work", 0]
+    # without a mask: no noise mask, the result is resized back to the input's size
+    g = wf.build(_params(wf, prompt="x", denoise=0.5, images={"image": "in.png"}))
+    _check_graph(g)
+    assert "SetLatentNoiseMask" not in _classes(g) and g["split"]["inputs"]["denoise"] == 0.5
+    assert g[g["save"]["inputs"]["images"][0]]["class_type"] == "ResizeImageMaskNode"
+
+
+def test_pick_with_input_image():
+    assert workflows.pick("image", slots={"image"}).name == "z-image-turbo"
+    assert workflows.pick("image", slots={"image", "mask"}).name == "z-image-turbo"
+    assert workflows.pick("image", slots={"image", "mask", "ref1"}).name == "flux2-klein-4b"
+    assert workflows.pick("image", "flux2-klein-4b", {"image"}).name == "flux2-klein-4b"
+
+
+def test_edit_parameters_validated():
+    from localgen_mcp.workflows.image_edit import edit_images
+    assert edit_images(None, None, ["a.png"], None, None, None) == {"ref1": "a.png"}
+    assert edit_images("in.png", "m.png", ["a.png"], 0.5, None, None) == {"ref1": "a.png", "image": "in.png",
+                                                                          "mask": "m.png"}
+    with pytest.raises(ValueError, match="mask_image needs input_image"):
+        edit_images(None, "m.png", ["a.png"], None, None, None)
+    with pytest.raises(ValueError, match="denoise needs input_image"):
+        edit_images(None, None, [], 0.5, None, None)
+    for bad in (0.0, 1.5, -1):
+        with pytest.raises(ValueError, match="between"):
+            edit_images("in.png", None, [], bad, None, None)
+    with pytest.raises(ValueError, match="width and height"):
+        edit_images("in.png", None, [], None, 512, None)
+    with pytest.raises(ValueError, match="at most 3"):
+        edit_images("in.png", None, ["a", "b", "c", "d"], None, None, None)
+    with pytest.raises(ValueError, match="at most 4"):
+        edit_images(None, None, ["a", "b", "c", "d", "e"], None, None, None)
