@@ -26,7 +26,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, jobs, model_files, retopo, rig, speech, workflows
+from . import backend, blender_run, config, cutout, jobs, model_files, retopo, rig, speech, workflows
 from .workflows.part_isolate import part_prompt
 
 
@@ -576,6 +576,40 @@ async def _texture(clean, src, prompt, style_image, views, texture_size, denoise
     result["fbx"] = maps["fbx"]
     result["maps"] = maps
     return result
+
+
+@mcp.tool()
+async def remove_background(
+    images: list[str],
+    trim: bool = False,
+    padding: float = 0.05,
+    square: bool = False,
+    size: int | None = None,
+    background: str | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Cut the subject out of one or more images: PNG cut-outs with a transparent background (BiRefNet).
+
+    images: 1 to 64 local image paths (PNG, JPEG, WebP, GIF, BMP or TIFF; the first frame of an
+    animation). All are processed in one batch, so the model loads once; pass them together.
+    With no other option each output is the same size as its input, the subject opaque and the
+    background transparent, so it lines up with the original for compositing.
+    trim=True crops to the subject's bounding box, plus padding on every side (a fraction of the
+    subject's longer side, default 0.05; 0 is a tight crop). padding applies only with trim.
+    square=True centres the result on a square transparent canvas (for icons and sprites).
+    size: scale so the longer side is this many pixels (16 to 4096); with square, size x size.
+    background: a colour like "#ffffff" to flatten onto instead of transparency (RGB PNG).
+    Typical calls: UI icon trim=True, square=True, size=256; item sprite trim=True, padding=0;
+    cut-out for compositing: no options.
+    Returns per image the input, the output path, its size and the subject box found (x0, y0, x1,
+    y1 in input pixels, with trim). A second, model free pass does the layout when any option is
+    set. Default output folder: /ai/output/localgen/cutout/<date>/.
+    """
+    logger.info("remove_background: %d image(s) trim=%s square=%s size=%s", len(images or []), trim, square, size)
+    return await cutout.remove_background(settings, images, trim, padding, square, size, background, output_dir,
+                                          idle_timeout_seconds, TIMEOUTS["image"], _progress(ctx))
 
 
 # -- speech ---------------------------------------------------------------
