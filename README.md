@@ -17,6 +17,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
+| `remove_background` | Cut the subject out of 1 to 64 images in one batch (BiRefNet): RGBA PNGs with a transparent background. Optional `trim` to the subject with `padding`, `square` canvas, output `size`, or a solid `background` colour. For UI icons, item sprites and compositing. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -71,6 +72,16 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Placement:** each part is placed by its box: scaled to fit it, with depth taken from a whole-object mesh made from the same concept, which is also given back as `full_mesh`.
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
+
+### Background removal
+
+`remove_background` takes a list of images and returns one PNG per image, the subject opaque and the background transparent.
+- **No options:** each cut-out is the size of its input and lines up with it, ready for compositing.
+- **`trim=True`:** crops to the subject's bounding box, plus `padding` on every side as a fraction of the subject's longer side (default 0.05; 0 for a tight crop). The result reports the box found, in input pixels.
+- **`square=True`:** centres the result on a square transparent canvas. **`size`:** scales the longer side to that many pixels (with `square`, size x size). **`background="#rrggbb"`:** flattens onto a solid colour instead (RGB PNG).
+- Typical calls: a UI icon is `trim=True, square=True, size=256`; an item sprite is `trim=True, padding=0`.
+- **How:** one ComfyUI prompt holds a chain per image, so BiRefNet loads once for the batch: `RemoveBackground` gives the foreground mask, and `JoinImageWithAlpha` gets `InvertMask` of it, because it inverts its alpha input (it expects LoadImage's 1 - alpha convention). With any option set, a second prompt without a model crops, pads, scales and flattens each cut-out using native nodes (`ImageCrop`, `ImageCompositeMasked`, `ImageScale` with Lanczos). No native node returns a bounding box as numbers, so pass 1 also saves a 512 px copy of the mask and the server reads the box from it with the standard library, rounding outwards.
+- **Limits:** the edge colour is the original pixel colour, so semi-transparent edges (hair, fur) keep a trace of the old background; a plain background that contrasts with the subject gives the cleanest result. Mask values under about 5% count as background when finding the box. Only the first frame of an animated GIF or WebP is used.
 
 ### Idle timeout
 
