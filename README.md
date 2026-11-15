@@ -37,6 +37,12 @@ Generated meshes are about 300k faces with textures baked for that mesh. For a g
   - `method="quad"` (default) gives an even all-quad mesh, suited to rigging and deformation.
   - `method="decimate"` gives triangles that keep the silhouette closest.
   - It then unwraps new UVs and bakes base color, roughness, metallic and a tangent space normal map from the original with Cycles on the CPU. Colour values are copied byte for byte (a test checks this).
+  - **Where the detail goes** (`method="decimate"` only):
+    - `detail="auto"` (default) keeps more faces where the surface bends sharply, such as fingers, joints and face features, and fewer on flat panels.
+    - `detail="paint"` reads the mesh's vertex colours as a map you paint in Blender: white for the most detail, black for the least. Export as GLB, which keeps vertex colours.
+    - `detail="none"` is uniform. `detail_strength` (0 to 1) scales the effect; 1 is the most that keeps the shape intact.
+    - The report gives the share of faces that landed in the detailed areas; on the test robot, the 16% of the surface marked detailed got 27% of the faces.
+    - The quad remeshers have no per-area density, so quad output is uniform.
   - Thin parts far from the new surface can bake with dark specks; a higher `target_faces` reduces them.
   - glTF stores only triangles, so the GLB holds each quad as two triangles; the FBX written beside it keeps the quads and embeds the textures.
 

@@ -36,6 +36,8 @@ target_faces = int(argv[2])
 method = argv[3]
 tex_size = int(argv[4])
 remesh_python = argv[5] if len(argv) > 5 else ""  # a Python with localgen_mcp and pynanoinstantmeshes
+detail_source = argv[6] if len(argv) > 6 else "auto"  # auto | paint | none (decimate only)
+detail_strength = float(argv[7]) if len(argv) > 7 else 1.0
 report = {"input": src, "output": dst, "method_requested": method, "target_faces": target_faces}
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -81,16 +83,126 @@ def fresh_low():
     return low
 
 
-def decimate(faces):
+def weld(obj):
+    """Merge vertices split along UV seams by the glTF import, so decimation sees one surface."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=max(hi - lo) * 1e-5)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+
+def mesh_arrays(mesh):
+    nv = len(mesh.vertices)
+    normals = np.empty(nv * 3, dtype=np.float32)
+    mesh.vertex_normals.foreach_get("vector", normals)
+    edges = np.empty(len(mesh.edges) * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", edges)
+    return normals.reshape(-1, 3), edges.reshape(-1, 2)
+
+
+def smooth_field(values, edges, iterations=3):
+    """Average each vertex with its neighbours, so the detail map has soft borders."""
+    deg = np.bincount(edges.ravel(), minlength=len(values)).astype(np.float64)
+    for _ in range(iterations):
+        acc = values.astype(np.float64).copy()
+        np.add.at(acc, edges[:, 0], values[edges[:, 1]])
+        np.add.at(acc, edges[:, 1], values[edges[:, 0]])
+        values = acc / (deg + 1.0)
+    return values
+
+
+def curvature_detail(mesh):
+    """0..1 per vertex: how sharply the surface bends there (fingers, joints, face features, edges)."""
+    normals, edges = mesh_arrays(mesh)
+    bend = 1.0 - np.einsum("ij,ij->i", normals[edges[:, 0]], normals[edges[:, 1]])
+    per_vertex = np.zeros(len(normals))
+    np.maximum.at(per_vertex, edges[:, 0], bend)
+    np.maximum.at(per_vertex, edges[:, 1], bend)
+    per_vertex = smooth_field(per_vertex, edges)
+    lo_q, hi_q = np.percentile(per_vertex, 50), np.percentile(per_vertex, 95)
+    return np.clip((per_vertex - lo_q) / max(hi_q - lo_q, 1e-9), 0.0, 1.0)
+
+
+def painted_detail(mesh):
+    """0..1 per vertex from the mesh's colour attribute (white = full detail, black = least)."""
+    attr = mesh.color_attributes.active_color or (mesh.color_attributes[0] if len(mesh.color_attributes) else None)
+    if attr is None:
+        raise SystemExit("detail='paint' needs vertex colours on the mesh (paint them in Blender, export a GLB)")
+    raw = np.empty(len(attr.data) * 4, dtype=np.float32)
+    attr.data.foreach_get("color", raw)
+    lum = raw.reshape(-1, 4)[:, :3] @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    if attr.domain == "CORNER":
+        vidx = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", vidx)
+        total = np.bincount(vidx, weights=lum, minlength=len(mesh.vertices))
+        count = np.bincount(vidx, minlength=len(mesh.vertices))
+        lum = total / np.maximum(count, 1)
+    _, edges = mesh_arrays(mesh)
+    return np.clip(smooth_field(lum, edges, 1), 0.0, 1.0)
+
+
+def decimate_once(ratio, weights):
     low = fresh_low()
-    tris = len(low.data.polygons)
-    if tris > faces:
+    if ratio < 1.0:
         mod = low.modifiers.new("dec", "DECIMATE")
         mod.decimate_type = "COLLAPSE"
-        mod.ratio = faces / tris
+        mod.ratio = ratio
         mod.use_collapse_triangulate = True
+        if weights is not None:
+            # Blender collapses high-weight vertices first, so the group holds the detail map
+            # and is inverted: high detail is kept, low detail goes first.
+            group = low.vertex_groups.new(name="detail")
+            for value in np.unique(np.round(weights, 2)):
+                idx = np.nonzero(np.round(weights, 2) == value)[0].tolist()
+                group.add(idx, float(value), "REPLACE")
+            mod.vertex_group = group.name
+            mod.invert_vertex_group = True
         bpy.ops.object.modifier_apply(modifier=mod.name)
     return low
+
+
+def decimate(faces):
+    weld(high)  # once: every later copy starts welded
+    weights = None
+    tris = sum(len(p.vertices) - 2 for p in high.data.polygons)
+    if detail_source != "none" and tris > faces:
+        detail = curvature_detail(high.data) if detail_source == "auto" else painted_detail(high.data)
+        # Strength 0 is uniform. The contrast is capped (weights stay within 0.15..0.85): with
+        # weights near 0, Blender collapses those areas almost completely and the shape caves in.
+        weights = 0.5 + 0.7 * detail_strength * (detail - 0.5)
+        report["detail"] = {"source": detail_source, "strength": detail_strength,
+                            "share_of_vertices_marked_detailed": round(float((detail > 0.5).mean()), 3)}
+    if tris <= faces:
+        return fresh_low()
+    # A weighted collapse does not land exactly on the ratio; search for the one that hits the budget.
+    ratio, best = faces / tris, None
+    for _ in range(5):
+        low = decimate_once(ratio, weights)
+        n = len(low.data.polygons)
+        if best is None or abs(n - faces) < abs(best[1] - faces):
+            best = (ratio, n)
+        if abs(n - faces) <= 0.03 * faces:
+            break
+        ratio = min(1.0, ratio * faces / max(n, 1))
+    if len(low.data.polygons) != best[1]:
+        low = decimate_once(best[0], weights)
+    if weights is not None:
+        # How the faces ended up: share of the result inside the areas marked detailed.
+        report["detail"]["share_of_faces_in_detailed_areas"] = detail_face_share(low, weights)
+    return low
+
+
+def detail_face_share(low, weights):
+    """Fraction of the low poly faces lying in the high detail areas of the original (nearest vertex)."""
+    from mathutils.kdtree import KDTree
+    tree = KDTree(len(high.data.vertices))
+    for v in high.data.vertices:
+        tree.insert(v.co, v.index)
+    tree.balance()
+    hits = sum(1 for p in low.data.polygons if weights[tree.find(p.center)[1]] > 0.5)
+    return round(hits / max(len(low.data.polygons), 1), 3)
 
 
 # Voxel grid sizes (cells across the largest dimension) to try for quad remeshing.

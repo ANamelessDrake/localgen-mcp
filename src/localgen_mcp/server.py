@@ -233,6 +233,8 @@ async def retopologize_mesh(
     method: str = "quad",
     texture_size: int = 2048,
     output_dir: str | None = None,
+    detail: str | None = None,
+    detail_strength: float = 1.0,
 ) -> dict:
     """Make a game weight copy of a textured GLB: new topology, new UVs, and baked PBR textures.
 
@@ -240,12 +242,19 @@ async def retopologize_mesh(
     rigging, deformation and further modelling. "decimate": triangles, closest silhouette.
     The new mesh gets a fresh UV layout, and base color, roughness, metallic and a tangent space
     normal map baked from the original (target_faces 200 to 500000, texture_size 256 to 8192).
+    Where the faces go (method "decimate" only): detail "auto" (default) keeps more faces where the
+    surface bends sharply (fingers, joints, face features) and fewer on flat panels; "paint" reads the
+    mesh's vertex colours as a detail map you painted in Blender (white = most detail, black = least;
+    export as GLB); "none" is uniform. detail_strength 0 to 1 sets how strongly (default 1, the most
+    that keeps the shape intact). The quad
+    method always uses one density everywhere.
     Runs in headless Blender on the CPU, about 10 to 30 s at 10k faces; the GPU is not used.
     Output: <output_dir or the input's folder>/<name>_retopo_<method>_<faces>.glb, plus an .fbx
     with embedded textures that keeps real quads (glTF stores only triangles).
     Returns the path, face and vertex counts before and after, the method that ran and timings.
     """
-    return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir)
+    return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir,
+                                     detail, detail_strength)
 
 
 @mcp.tool()

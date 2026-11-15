@@ -47,7 +47,11 @@ def test_command_runs_the_bundled_script_with_this_interpreter(settings, tmp_pat
     assert cmd[cmd.index("-t") + 1] == "4"
     assert Path(cmd[cmd.index("-P") + 1]) == retopo.SCRIPT and retopo.SCRIPT.is_file()
     assert cmd[cmd.index("--") + 1:] == [str(tmp_path / "in.glb"), str(tmp_path / "out.glb"), "8000",
-                                         "quad", "1024", sys.executable]
+                                         "quad", "1024", sys.executable, "none", "1.0"]
+    cmd = retopo.command(settings, tmp_path / "in.glb", tmp_path / "out.glb", 8000, "decimate", 1024)
+    assert cmd[-2:] == ["auto", "1.0"]
+    cmd = retopo.command(settings, tmp_path / "in.glb", tmp_path / "out.glb", 8000, "decimate", 1024, "paint", 0.3)
+    assert cmd[-2:] == ["paint", "0.3"]
 
 
 def test_report_is_parsed_from_the_last_marker_line():
@@ -122,3 +126,20 @@ def test_texture_input_drops_materials_and_referenced_images(settings, tmp_path)
     doc = json.loads(data[20:20 + int.from_bytes(data[12:16], "little")])
     assert not doc.get("images") and not doc.get("materials")
     assert doc["meshes"][0]["primitives"][0]["attributes"].get("TEXCOORD_0") is not None  # UVs kept
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender is not installed")
+def test_painted_detail_puts_the_faces_where_painted(settings, tmp_path):
+    src = tmp_path / "painted.glb"
+    subprocess.run([BLENDER, "-b", "--factory-startup", "-P", str(HERE / "blender_make_painted.py"), "--", str(src)],
+                   check=True, capture_output=True, timeout=300)
+    uniform = asyncio.run(retopo.retopologize(settings, str(src), 1500, "decimate", 256, str(tmp_path / "u"),
+                                              detail="none"))
+    painted = asyncio.run(retopo.retopologize(settings, str(src), 1500, "decimate", 256, str(tmp_path / "p"),
+                                              detail="paint"))
+    assert "detail" not in uniform
+    d = painted["detail"]
+    assert d["source"] == "paint" and 0.4 < d["share_of_vertices_marked_detailed"] < 0.6
+    # Half the surface is painted white; uniform decimation would put about half the faces there.
+    assert d["share_of_faces_in_detailed_areas"] > 0.65, d
+    assert abs(painted["output_faces"] - 1500) <= 0.05 * 1500
