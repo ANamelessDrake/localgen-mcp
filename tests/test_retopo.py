@@ -166,3 +166,110 @@ def test_parts_are_placed_by_their_boxes_and_rigged_at_the_joint(settings, tmp_p
     px, _, pz = rep["parts"]["arm"]["pivot"]
     assert abs(px - 0.25) < 0.03 and 0.4 < pz < 0.9  # the joint is the shoulder face
     assert (tmp_path / "out.fbx").stat().st_size > 10000
+
+
+# -- LOD chains -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("lods", [[], [3000, 3000], [3000, 8000], [10000, 100], [10000, 5000.5], "10000,3000",
+                                  [True], list(range(9000, 0, -1000)), [600_000, 3000]])
+def test_rejects_bad_lods(lods):
+    with pytest.raises(retopo.RetopoError):
+        retopo.validate_lods(lods)
+
+
+def test_accepts_lods():
+    assert retopo.validate_lods(None) is None
+    assert retopo.validate_lods([10000, 3000.0, 800]) == [10000, 3000, 800]
+
+
+def test_lod_object_names_are_safe():
+    assert retopo.lod_object_name(Path("/x/199b74d60b_00001_.glb")) == "199b74d60b_00001"
+    assert retopo.lod_object_name(Path("/x/my robot (v2).glb")) == "my_robot_v2"
+    assert retopo.lod_object_name(Path("/x/---.glb")) == "mesh"
+
+
+def test_command_passes_lods_and_the_object_name(settings, tmp_path, monkeypatch):
+    monkeypatch.setattr(retopo.blender_run.shutil, "which", lambda name: "/usr/bin/true")
+    cmd = retopo.command(settings, tmp_path / "bot.glb", tmp_path / "out.glb", 8000, "quad", 1024,
+                         lods=[8000, 2000, 500])
+    assert cmd[-4:] == ["none", "1.0", "8000,2000,500", "bot"]
+
+
+def test_generate_mesh_checks_lods_before_any_gpu_work(monkeypatch):
+    from localgen_mcp import server
+
+    async def boom(*a, **k):
+        raise AssertionError("the workflow ran before lods were checked")
+
+    monkeypatch.setattr(server.jobs, "run_workflow", boom)
+    with pytest.raises(retopo.RetopoError):
+        asyncio.run(server.generate_mesh(input_image="/nonexistent.png", retopo_lods=[3000, 9000]))
+
+
+def glb_json(path: Path) -> dict:
+    data = path.read_bytes()
+    return json.loads(data[20:20 + int.from_bytes(data[12:16], "little")])
+
+
+def inspect_lods(path: Path) -> dict:
+    proc = subprocess.run([BLENDER, "-b", "--factory-startup", "-P", str(HERE / "blender_inspect_lods.py"), "--",
+                           str(path)], check=True, capture_output=True, text=True, timeout=300)
+    return retopo.blender_run.parse_report(proc.stdout, "LODS")
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender is not installed")
+@pytest.mark.parametrize("method", ["decimate", "quad"])
+def test_lod_chain_shares_one_uv_layout_and_material(settings, tmp_path, method):
+    src = tmp_path / "crate.glb"
+    subprocess.run([BLENDER, "-b", "--factory-startup", "-P", str(HERE / "blender_make_textured.py"),
+                    "--", str(src)], check=True, capture_output=True, timeout=300)
+    lods = [1500, 500, 200]
+    report = asyncio.run(retopo.retopologize(settings, str(src), 99999, method, 256, str(tmp_path / "out"),
+                                             lods=lods))
+    glb, fbx = Path(report["path"]), Path(report["fbx"])
+    assert glb.name == f"crate_retopo_{method}_lods_1500_500_200.glb" and fbx.is_file()
+    names = [f"crate_LOD{i}" for i in range(3)]
+    assert [e["name"] for e in report["lods"]] == names
+    assert report["target_faces"] == 1500 and report["materials"] == ["retopo"]
+    assert abs(report["output_faces"] - 1500) <= 0.1 * 1500  # LOD0 is the retopology itself
+    for entry, budget in zip(report["lods"][1:], lods[1:]):
+        assert abs(entry["triangles"] - budget) <= 0.05 * budget, entry
+        fit = entry["texture_fit"]  # LOD0's layout, not a new one (a fresh unwrap measures about 100)
+        assert fit["uv_drift_texels_median"] < 3 and fit["colour_mismatch_share"] < 0.02, entry
+    # LOD0 keeps the base colour bake (the single output's colour check still holds)
+    baked = report["base_color_median"]["baked"]
+    assert all(abs(b - s) <= 6 for b, s in zip(baked, (200, 60, 30))), baked
+
+    # The GLB: one node per LOD, one material and one texture set referenced by all of them.
+    doc = glb_json(glb)
+    assert sorted(n["name"] for n in doc["nodes"]) == names
+    assert len(doc["materials"]) == 1 and len(doc["images"]) <= 4
+    assert all(p["material"] == 0 for m in doc["meshes"] for p in m["primitives"])
+    tris = {n["name"]: sum(doc["accessors"][p["indices"]]["count"] // 3 for p in doc["meshes"][n["mesh"]]["primitives"])
+            for n in doc["nodes"]}
+    assert [tris[n] for n in names] == [e["triangles"] for e in report["lods"]]
+
+    # Re-imported from both files: the LOD objects, one shared material, and LOD0's UVs on every LOD.
+    for path in (glb, fbx):
+        seen = inspect_lods(path)
+        objs = {o["name"]: o for o in seen["objects"]}
+        assert sorted(objs) == names, seen
+        assert seen["materials"] == ["retopo"] and all(o["materials"] == ["retopo"] for o in objs.values())
+        for name in names[1:]:
+            assert objs[name]["uv_error_median"] * 256 < 3, (path.suffix, objs[name])
+        if path == fbx and method == "quad":
+            assert objs[names[0]]["faces"] == report["lods"][0]["faces"]  # LOD0 keeps its quads
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender is not installed")
+def test_lods_follow_the_painted_detail_map(settings, tmp_path):
+    src = tmp_path / "painted.glb"
+    subprocess.run([BLENDER, "-b", "--factory-startup", "-P", str(HERE / "blender_make_painted.py"), "--", str(src)],
+                   check=True, capture_output=True, timeout=300)
+    report = asyncio.run(retopo.retopologize(settings, str(src), 0, "decimate", 256, str(tmp_path / "p"),
+                                             detail="paint", lods=[3000, 1000, 300]))
+    # Half the surface is painted white. LOD0 puts about 0.9 of its faces there; a uniform decimation
+    # of LOD0 drifts back toward a half (measured 0.78 and 0.63), the weighted one holds (0.91, 0.81).
+    shares = [e["share_of_faces_in_detailed_areas"] for e in report["lods"][1:]]
+    assert shares[0] > 0.85 and shares[1] > 0.72, shares

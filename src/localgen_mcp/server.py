@@ -26,7 +26,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, jobs, model_files, retopo, workflows
+from . import backend, blender_run, config, jobs, model_files, retopo, rig, speech, workflows
 from .workflows.image_edit import edit_images
 from .workflows.part_isolate import part_prompt
 
@@ -70,7 +70,8 @@ mcp = FastMCP(
         "paths (open them to view). The shared backend starts on the first call (about 10 s, plus model "
         "load) and stops itself after an idle timeout (default 300 s). Pass idle_timeout_seconds, or call "
         "start_backend first, when planning a long batch; call stop_backend when done to free GPU memory. "
-        "Only one large model fits in VRAM at a time; switching modality reloads models."
+        "Only one large model fits in VRAM at a time; switching modality reloads models. "
+        "speak (text to speech) runs on the CPU without the backend; list_voices shows its voices."
     ),
 )
 
@@ -192,6 +193,7 @@ async def generate_mesh(
     framing: str = "crop",
     retopo_faces: int | None = None,
     retopo_method: str = "quad",
+    retopo_lods: list[int] | None = None,
     seed: int | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
@@ -211,12 +213,14 @@ async def generate_mesh(
     scale for all views, as from a 3D render rig at 20 degrees horizontal FOV).
     remove_background=False uses the image's own alpha channel instead of BiRefNet.
     retopo_faces (for example 10000): also make a game weight copy with retopologize_mesh
-    (retopo_method "quad" or "decimate"); the result's "retopo" entry has its path. For a plain
+    (retopo_method "quad" or "decimate"); the result's "retopo" entry has its path. retopo_lods (for
+    example [10000, 3000, 800]) makes a LOD chain instead, as retopologize_mesh's lods. For a plain
     triangle mesh at a given size, face_count alone does it inside the generation.
     Returns the GLB path, the reference image path when one was generated, seed, settings and timings.
     """
     if not input_image and not prompt:
         raise ValueError("give input_image or prompt")
+    retopo.validate_lods(retopo_lods)  # before the GPU work, not after it
     side_views = {"left": left_image, "back": back_image, "right": right_image}
     side_views = {k: v for k, v in side_views.items() if v}
     if side_views and not input_image:
@@ -244,9 +248,10 @@ async def generate_mesh(
     if reference is not None:
         result["reference_image"] = reference["paths"][0]
         result["reference_image_seconds"] = reference["total_seconds"]
-    if retopo_faces:
-        result["retopo"] = await retopo.retopologize(settings, result["paths"][0], retopo_faces,
-                                                     retopo_method, texture_size or 2048, output_dir)
+    if retopo_faces or retopo_lods:
+        result["retopo"] = await retopo.retopologize(settings, result["paths"][0], retopo_faces or 10000,
+                                                     retopo_method, texture_size or 2048, output_dir,
+                                                     lods=retopo_lods)
     return result
 
 
@@ -259,6 +264,7 @@ async def retopologize_mesh(
     output_dir: str | None = None,
     detail: str | None = None,
     detail_strength: float = 1.0,
+    lods: list[int] | None = None,
 ) -> dict:
     """Make a game weight copy of a textured GLB: new topology, new UVs, and baked PBR textures.
 
@@ -276,9 +282,67 @@ async def retopologize_mesh(
     Output: <output_dir or the input's folder>/<name>_retopo_<method>_<faces>.glb, plus an .fbx
     with embedded textures that keeps real quads (glTF stores only triangles).
     Returns the path, face and vertex counts before and after, the method that ran and timings.
+    lods (for example [10000, 3000, 800]): a LOD chain for a game engine instead of one mesh. lods[0]
+    replaces target_faces and is LOD0, the retopology above with its baked textures; each further
+    entry is a triangle budget for a decimation of LOD0 that keeps LOD0's UVs, so every LOD uses the
+    same textures and one material. Entries must be strictly decreasing (1 to 8 of them). Output:
+    <name>_retopo_<method>_lods_<budgets>.glb and .fbx holding objects <name>_LOD0, <name>_LOD1, ...
+    (Unity's FBX importer builds a LOD Group from that suffix). The report's "lods" lists each LOD's
+    face and triangle counts and texture_fit: uv_drift_texels_median (how far its UVs sit from LOD0's
+    at the same place; a few texels is right, hundreds means broken mapping) and colour_mismatch_share
+    (share of its triangles whose base colour differs from LOD0's there; it grows as small features
+    collapse). With method "decimate", the detail map also steers the LOD decimations.
     """
     return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir,
-                                     detail, detail_strength)
+                                     detail, detail_strength, lods)
+
+
+@mcp.tool()
+async def rig_creature(
+    input_mesh: str,
+    preset: str = "auto",
+    bones: int | None = None,
+    axis: str | list[float] | None = None,
+    root_end: str | list[float] | None = None,
+    wing_chains: int = 3,
+    wing_bones: int = 4,
+    weights: str = "auto",
+    name: str | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    """Soft rig for an organic creature (tentacles, tails, vines, rays, fish): bone chains with smooth skin
+    weights, so engine scripts or physics (Verlet, springs) can bend it. No animation clips are made.
+
+    Call it on a clean mesh: run retopologize_mesh first (generated meshes are about 300k faces with
+    stray shells; a quad retopology of 5k to 20k faces skins and deforms far better). input_mesh: a GLB.
+    preset:
+      "chain": one chain of `bones` (default 8) along the mesh's main axis, or `axis`; for tentacles,
+        tails, vines. Bones are named <name>_01.. from the root (name default "tentacle").
+      "spine": the same along the body, named spine_01.. (default 6 bones).
+      "wings": stingray, manta, bat or bird: a spine along the body length (`bones`, default 6) and,
+        on each side, `wing_chains` (default 3) chains of `wing_bones` (default 4) fanning from the body
+        to the wing edge. Named spine_01.., wing_L1_01.. and the mirrored wing_R1_01.. (L is the
+        positive side of the left-right axis: +X when that is X, the creature's left when it faces -Y as
+        generated meshes do; chain 1 is nearest the head).
+      "auto" (default): chain if long and thin, wings if flat and broad, else spine; the report says
+        which and why.
+    axis: "x", "y", "z" or [x, y, z]: the chain direction, or the body length for "wings"
+    (default: from the mesh's principal axes; for wings, the left-right axis is the one the mesh is
+    mirror symmetric across).
+    root_end: which end the chain (or the spine, at the head) starts from: "min" or "max" along the
+    axis, or a point [x, y, z] (the end nearest it). Default: a vertical chain starts at its lower end,
+    otherwise at the thicker end (a tentacle's base); wings start at the wider end (a tail is narrow).
+    weights: "auto" tries Blender's heat weights and falls back to a smooth distance falloff from the
+    bones when they fail (more than 1% of the vertices unweighted or on a far bone, common on generated
+    meshes); "distance" always uses the falloff. Every vertex gets at most 4 influences, normalised.
+    Bone axes: local Y runs along each bone; rotate about local X to bend (for wings, local Z is the
+    surface normal, so local X rotation flaps up and down).
+    Output: <output_dir or the input's folder>/<input name>_rig_<preset>.glb and .fbx (armature and skinned
+    mesh, rest pose). Returns the bones (head, tail, parent), the preset used, weight coverage and
+    method, and warnings. Headless Blender on the CPU, a few seconds.
+    """
+    return await rig.rig_creature(settings, input_mesh, preset, bones, axis, root_end, wing_chains, wing_bones,
+                                  weights, name, output_dir)
 
 
 def _reuse_file(root: Path, entry, kind: str) -> str | None:
@@ -533,6 +597,52 @@ async def _texture(clean, src, prompt, style_image, views, texture_size, denoise
     result["fbx"] = maps["fbx"]
     result["maps"] = maps
     return result
+
+
+# -- speech ---------------------------------------------------------------
+
+
+@mcp.tool()
+async def speak(
+    text: str,
+    voice: str | None = None,
+    speed: float = 1.0,
+    effect: str = "none",
+    intensity: float = 0.5,
+    seed: int | None = None,
+    name: str | None = None,
+    output_dir: str | None = None,
+    keep_dry: bool = True,
+) -> dict:
+    """Speak a line of text (English) to a WAV file, with an optional game voice effect. Runs on the CPU.
+
+    Model: Kokoro-82M (Apache 2.0) in its own venv, offline; ComfyUI and the GPU are not used, so it
+    never waits on image or video jobs. About 10 s to load plus about 1 s per sentence.
+    voice: an installed voice name (see list_voices; default "af_heart"), or a comma separated blend
+    of up to 4 voices with the same accent, averaged ("am_michael,bm_george" is invalid: two accents;
+    "am_michael,am_fenrir" is fine). Prefix a = American, b = British; f = female, m = male.
+    speed: 0.5 to 2.0 (1.0 normal).
+    effect: "none"; "radio" (band limited, compressed, light hiss, like a comms channel); "robotic"
+    (flat buzzing monotone with a metallic echo); "glitch" (a voice struggling on low power: stutters
+    on word onsets, dropouts, bursts of bit crushing). intensity 0 to 1 (default 0.5) scales the effect.
+    seed makes the glitch pattern and noise reproducible (returned in the result either way).
+    name: file name stem for the line (for example "pathfinder_hull_40_lowpower"); an existing file
+    with that name is overwritten. Default: <voice>_<effect>_<random>.
+    keep_dry: with an effect, also keep the unprocessed take as <name>_dry.wav.
+    Output: 24 kHz mono 16 bit WAV, plus an OGG Vorbis copy when ffmpeg is installed, in output_dir
+    (default /ai/output/localgen/audio/<date>/). Returns the paths, duration, sample rate, RMS and peak
+    level, word timings and the seed. Text up to 2000 characters; one call per line of dialogue.
+    """
+    logger.info("speak: %r voice=%s effect=%s", text[:80], voice, effect)
+    return await speech.speak(settings, text, voice, speed, effect, output_dir, intensity, seed, name, keep_dry)
+
+
+@mcp.tool()
+async def list_voices() -> dict:
+    """Text to speech voices installed for speak(): name, accent, gender and Kokoro's quality grade
+    (A best, F worst; higher grades had more and cleaner training audio), the effects available,
+    and whether ffmpeg (for effects and OGG output) was found."""
+    return await asyncio.to_thread(speech.voices_report, settings)
 
 
 # -- backend control ------------------------------------------------------

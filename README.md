@@ -14,9 +14,12 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). With `input_image` and `denoise`, image to image; `mask_image` limits the change to a region and leaves the rest byte for byte (below). `count` queues several at once with one model load. |
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
-| `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
+| `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). `lods` adds a LOD chain sharing one texture set. Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces` or `retopo_lods`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
+| `speak` | Text to speech for game dialogue (Kokoro-82M, English, on the CPU): 24 kHz WAV plus OGG, in one of 28 voices or a blend, with an optional `effect` (`radio`, `robotic`, `glitch` for a voice struggling on low power). Needs `install.sh --with-tts`. |
+| `list_voices` | The installed voices (accent, gender, quality grade), the effects, and whether ffmpeg was found. |
+| `rig_creature` | Soft rig for an organic creature: bone chains (`chain` for tentacles, tails and vines; `spine`; `wings` for rays and other flat flyers; `auto` picks) with smooth skin weights, at most 4 per vertex, so engine scripts or physics can bend it. Writes a GLB and an FBX. Headless Blender on the CPU, a few seconds. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -58,6 +61,13 @@ Generated meshes are about 300k faces with textures baked for that mesh. For a g
     - The quad remeshers have no per-area density, so quad output is uniform.
   - Thin parts far from the new surface can bake with dark specks; a higher `target_faces` reduces them.
   - glTF stores only triangles, so the GLB holds each quad as two triangles; the FBX written beside it keeps the quads and embeds the textures.
+  - **LOD chains:** `lods=[10000, 3000, 800]` (or `generate_mesh(retopo_lods=...)`) writes LOD0, LOD1, LOD2 that share one UV layout and one texture set, so the engine loads one material.
+    - `lods[0]` replaces `target_faces`: LOD0 is the retopology above, with its baked textures.
+    - Each further LOD is a collapse decimation of LOD0 itself (not of the LOD before it), to that many triangles. Blender's collapse interpolates the UVs on each side of a UV seam separately, so LOD0's layout and textures still fit.
+    - One GLB and one FBX hold objects `<name>_LOD0`, `<name>_LOD1`, ...; Unity's FBX importer builds a LOD Group from that suffix. The FBX keeps LOD0's quads; the lower LODs are triangles.
+    - The report lists each LOD's face and triangle counts and a `texture_fit`, measured at each triangle's centre against the nearest point of LOD0: `uv_drift_texels_median` (a few texels when the layout is shared; a fresh unwrap measures about 100) and `colour_mismatch_share` (triangles whose base colour differs from LOD0's there, which grows as small parts collapse). The p90 drift can be large on a correct LOD, because a centre near a seam can find its nearest LOD0 point on the other island.
+    - Detail weighting: with `method="decimate"`, the same detail map (`detail`, `detail_strength`) also steers the LOD decimations, carried from the original to LOD0's vertices. Without it, LODs made from a weighted LOD0 drift back toward uniform density (on the painted test mesh, 0.78 and 0.63 of the faces in the detailed half instead of 0.91 and 0.81). With `method="quad"` the LODs are uniform, like LOD0.
+    - Limits: the lower LODs reuse LOD0's tangent space normal map, which fits less well as the shape simplifies. Strong reductions show it: on a test robot, a quad LOD0 of 18.8k triangles held up well down to 800 triangles, while a decimated LOD0 of 8k triangles taken to 600 grew spikes on thin parts (a direct 600 face decimation of the original has them too, though fewer). Quad LOD0s (the default) chain better.
 
 Quad remeshing uses [Instant Meshes](https://github.com/wjakob/instant-meshes) (BSD) through `pynanoinstantmeshes` in the MCP venv. Blender's own Quadriflow is the fallback but rejects many generated meshes, so expect `decimate` results if that package is missing. Blender (4.2 or later, any build) must be installed; `LOCALGEN_BLENDER` points at a specific one.
 
@@ -84,6 +94,38 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
+### Speech
+
+`speak` turns one line of English into a WAV file for game dialogue. It does not use ComfyUI or the GPU, so it runs beside image and video jobs.
+- **Model:** Kokoro-82M v1.0 (Apache 2.0) on the CPU, in its own venv (`<root>/venvs/localgen-tts`). The MCP server runs `src/localgen_mcp/tts/runner.py` with that venv's Python and reads its final `TTS_RESULT {json}` line, the same pattern as the Blender scripts. The runner gets `HF_HUB_OFFLINE=1` and a CPU only PyTorch build.
+- **Time:** about 5 s per line on 4 threads, most of it loading the model; each call starts a fresh process, so nothing stays in memory.
+- **Voices:** 20 American and 8 British English voices; `list_voices` gives Kokoro's quality grade for each (`af_heart` A, `af_bella` A-, `bf_emma` and `af_nicole` B-, the male voices C+ at best). A comma separated list of up to 4 voices with one accent is averaged into a new voice.
+- **Effects** (ffmpeg filter graphs in `tts/effects.py`; `intensity` 0 to 1 scales each):
+  - `radio`: band limited to about 300 to 3200 Hz, compressed, light crushing and hiss.
+  - `robotic`: a constant phase spectrum (a flat, buzzing monotone) with a short metallic echo.
+  - `glitch`: for the low power lines. Stutters repeat the onset of some words (placed with the model's word timings), with dropouts, bursts of heavy bit crushing and light crushing throughout. `seed` reproduces a take.
+  - The effected take is brought back to the dry take's peak level, and the dry take is kept as `<name>_dry.wav`.
+  - Without ffmpeg, the runner renders approximations with numpy and writes WAV only.
+- **Output:** 24 kHz mono 16 bit WAV and an OGG Vorbis copy, named by `name` (for example `pathfinder_hull_40_lowpower`). The result gives the duration, sample rate, RMS and peak level, and word timings (usable for subtitles).
+- **Limits:** English only. Very short lines (a word or two) are weaker; Kokoro's model card suggests bundling them. No voice cloning; see [docs/model-choices.md](docs/model-choices.md) for why Chatterbox was not chosen. Levels and durations are checked automatically; only a listener can judge the voice itself.
+
+### Soft rigs for creatures
+
+`rig_creature` rigs organic meshes for deformation driven in the engine (shaders, Verlet chains, springs); it makes no animation clips. Run it on a `retopologize_mesh` result: raw generated meshes are heavy and full of stray shells.
+- **Presets.**
+  - `chain`: `bones` (default 8) along the main axis or a given `axis`, rooted at `root_end` (default: the lower end of a vertical chain, else the thicker end). Joints are slice centroids, so the chain follows a gently curved mesh.
+  - `spine`: the same along a body.
+  - `wings`: the thin axis is the surface normal, and the left-right axis is the one the mesh is mirror symmetric across. A spine runs down the middle, and `wing_chains` chains of `wing_bones` bones fan out on each side to the wing edge.
+  - `auto`: picks from the proportions and reports why.
+- **Names.** `tentacle_01` (or `<name>_01`), `spine_01`, `wing_L1_01` and the mirrored `wing_R1_01`, numbered from the root and, for wing chains, from the head. Every bone's local Y runs along it; rotating about local X bends it (for wings, towards the surface normal: a flap).
+- **Weights.** Blender's heat weights first. They often fail on generated meshes: on the test manta, a spine rig left 100% of the vertices unweighted ("failed to find solution"). When more than 1% of the vertices are unweighted, or weighted mainly to a bone more than twice as far as their nearest, all weights are replaced by a smooth inverse distance falloff from the bone segments; a smaller share is patched. Vertices at the same position (split at UV seams) get the same weights, then each vertex keeps its 4 largest, normalised. The report gives the method, the heat failure shares, coverage and influences per vertex.
+- **Output.** A GLB and an FBX in the rest pose, and a report of every bone (head, tail, parent).
+- `scripts/render_glb_views.py ... --pose 'wing_.*=12'` renders a rig posed, framed like the rest pose, for before and after stills.
+- **Limits.**
+  - Joints come from straight slices, so a tentacle curled through more than about 90 degrees gets a chain that cuts the curve. Give it a straighter mesh or split it.
+  - Distance weights are Euclidean, so parts that touch without being connected (a tentacle curled against the body) pull on each other.
+  - On `wings`, the body is a fixed strip (12% of the half span each side of the middle). Anything outside it, such as a manta's head lobes, moves with the nearest wing chain.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -102,6 +144,7 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 | Video | Wan 2.2 TI2V 5B fp16 | Apache 2.0 | 18.15 GB |
 | Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
 | Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
+| Speech (optional, CPU) | Kokoro-82M v1.0, 28 English voices | Apache 2.0 | 0.34 GB, plus a 1.3 GB venv |
 
 All of them use native ComfyUI nodes; no custom nodes are installed.
 
@@ -122,7 +165,9 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
+| Soft rig (`rig_creature`) | 8k quad manta, `wings`, 30 bones | 2 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
+| Speech, one 4 to 6 s line (measured with the load average near 10) | Kokoro-82M, 4 CPU threads, any effect | about 5 s in the runner (mostly model load); 6 to 10 s per call over MCP | none (CPU) |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
@@ -131,19 +176,21 @@ Mesh quality was checked by rendering each GLB from the four rig views in Blende
 
 ## Install or rebuild
 
-Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found.
+Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found. ffmpeg is optional too: `speak` uses it for effects and OGG output.
 
 ```bash
 setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
 setup/install.sh --root /ai --dry-run  # show what would be done, change nothing
 setup/install.sh --skip-models         # software only
 setup/download-models.sh --only video  # weights for one group (image, video, mesh); --verify rechecks SHA256
+setup/install.sh --root /ai --with-tts # also the text to speech venv (CPU) and the Kokoro weights
 ```
 
 What gets pinned:
 - ComfyUI at commit `e08cc003` (0.45.0).
 - Both venvs from frozen lock files (`setup/comfyui-requirements.lock`, `setup/mcp-requirements.lock`).
 - Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`).
+- With `--with-tts`: the text to speech venv from `setup/tts-requirements.lock` (every package hashed, CPU only PyTorch) and the Kokoro files in `setup/tts.manifest`, into `<root>/models/tts`.
 
 Everything large lives under the install root: weights, venvs, uv's cache and managed Pythons, logs, outputs and temp files. Nothing goes in `/tmp` or the home directory. The scripts are idempotent; rerun them after an interruption.
 
@@ -197,6 +244,11 @@ Run state, all under `<root>/run/localgen`: `start.lock`, `supervisor.lock`, `su
 | `LOCALGEN_BLENDER` | `blender` on `PATH` | For retopology |
 | `LOCALGEN_BLENDER_THREADS` | 8 | CPU threads for Blender's bake |
 | `LOCALGEN_TIMEOUT_RETOPO` | 1800 s | |
+| `LOCALGEN_TTS_PYTHON` | `<root>/venvs/localgen-tts/bin/python` | Text to speech venv |
+| `LOCALGEN_TTS_MODEL_DIR` | `<root>/models/tts/kokoro-82m` | |
+| `LOCALGEN_TTS_THREADS` | 4 | CPU threads for synthesis |
+| `LOCALGEN_TIMEOUT_TTS` | 600 s | |
+| `LOCALGEN_FFMPEG` | `ffmpeg` on `PATH` | Effects and OGG output |
 
 ## Adding a model
 
@@ -212,8 +264,10 @@ uv venv --python 3.12 /ai/venvs/localgen-mcp
 uv pip install --python /ai/venvs/localgen-mcp/bin/python -r setup/mcp-requirements.lock -e .
 /ai/venvs/localgen-mcp/bin/python -m pytest      # no GPU needed: the backend tests run against a fake ComfyUI
 scripts/mcp_call.py --list                       # talk to the server over stdio like an MCP client would
+PYTHONPATH=$PWD/src scripts/mcp_call.py --list   # the server gets this environment, so this runs a checkout's code
 scripts/mcp_call.py generate_image '{"prompt": "a red apple"}'
 blender -b -P scripts/render_glb_views.py -- mesh.glb out/mesh 512   # front, left, back, right stills of a GLB
+blender -b -P scripts/render_glb_views.py -- lods.glb out/lod2 512 0 1 robot_LOD2   # one object only, wireframe on
 ```
 
 The backend tests launch the real supervisor against `tests/fake_comfy/main.py`, a stand-in that answers the same endpoints and records its command line. They cover:
