@@ -18,13 +18,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-_MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview"]
+_MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh"]
 
 
 @dataclass(frozen=True)
 class Workflow:
     name: str
-    modality: str                      # image | video | mesh
+    modality: str                      # image | video | mesh | texture
     description: str
     models: list[str]                  # files under the ComfyUI models dir
     defaults: dict[str, Any]
@@ -35,6 +35,8 @@ class Workflow:
     min_images: int = 0
     is_default: bool = False
     limits: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Takes a 3D model file (uploaded to ComfyUI's input/3d) as params["mesh"].
+    needs_mesh: bool = False
 
     @property
     def image_input(self) -> str:

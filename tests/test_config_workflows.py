@@ -40,6 +40,9 @@ def _params(wf, **over):
     p = wf.params(over)
     p.setdefault("seed", 1)
     p["prefix"] = "localgen/test/x"
+    if wf.needs_mesh:
+        p.setdefault("mesh", "3d/localgen/m.glb")
+        p.setdefault("placeholder", "localgen/placeholder.png")
     return p
 
 
@@ -172,3 +175,55 @@ def test_only_real_images_are_uploaded(tmp_path):
     secret.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
     assert is_image_file(png) and is_image_file(webp)
     assert not is_image_file(secret)
+
+
+def test_texture_paints_each_view_from_its_own_clay_render():
+    wf = workflows.get("texture")
+    g = wf.build(_params(wf, prompt="a red robot", images={"style": "localgen/style.png"}, views=4))
+    _check_graph(g)
+    samplers = [k for k, n in g.items() if n["class_type"] == "SamplerCustomAdvanced"]
+    assert len(samplers) == 4
+    for v in range(4):
+        sample = g[f"paint{v}_sample"]["inputs"]
+        # image to image: the latent is the VAE encoding of this view's clay render, and only the
+        # low (denoise) part of the schedule runs; from an empty latent Klein drifts to a front view
+        init = g[sample["latent_image"][0]]
+        assert init["class_type"] == "VAEEncode" and init["inputs"]["pixels"] == [f"view{v}", 0]
+        assert g[sample["sigmas"][0]]["class_type"] == "SplitSigmasDenoise" and sample["sigmas"][1] == 1
+        assert g[f"view{v}"]["inputs"]["batch_index"] == v
+    # the style image guides the front view only
+    style_users = [k for k, n in g.items() if n["inputs"].get("image") == ["style", 0]]
+    assert len(style_users) == 1 and style_users[0].startswith("paint0_")
+    texts = [g[f"paint{v}_text"]["inputs"]["text"] for v in range(4)]
+    assert "clay render of the front" in texts[0] and "clay render of the back" in texts[2]
+    assert "clay render of the side" in texts[1] and "clay render of the side" in texts[3]
+    bake = g["bake"]["inputs"]
+    assert bake["camera_info"] == ["orbit", 0] and bake["mask"] == ["clay", 1] and bake["fill_unseen"] is True
+    assert g["load"]["inputs"]["model_file"] == "3d/localgen/m.glb"
+    assert "UnwrapMesh" in _classes(g)
+    assert "UnwrapMesh" not in _classes(wf.build(_params(wf, prompt="x", unwrap=False)))
+
+
+def test_texture_view_names():
+    from localgen_mcp.workflows.texture_mesh import view_name
+    assert [view_name(a) for a in (0, 90, 180, 270)] == ["front", "side", "back", "side"]
+    assert view_name(45) == "three-quarter front" or view_name(45).startswith("three-quarter")
+    assert view_name(350) == "front"
+
+
+def test_only_real_meshes_are_uploaded(tmp_path):
+    from localgen_mcp.jobs import is_mesh_file
+    glb = tmp_path / "a.glb"
+    glb.write_bytes(b"glTF" + b"\0" * 16)
+    obj = tmp_path / "b.obj"
+    obj.write_text("# made by hand\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+    stl = tmp_path / "c.stl"
+    stl.write_bytes(b"\0" * 80 + (1).to_bytes(4, "little") + b"\0" * 50)
+    assert is_mesh_file(glb) and is_mesh_file(obj) and is_mesh_file(stl)
+    fake_glb = tmp_path / "secret.glb"
+    fake_glb.write_text("not a model")
+    fake_obj = tmp_path / "notes.obj"
+    fake_obj.write_text("password=hunter2\n")
+    fake_stl = tmp_path / "id_rsa.stl"
+    fake_stl.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----" + b"x" * 200)
+    assert not any(is_mesh_file(f) for f in (fake_glb, fake_obj, fake_stl))

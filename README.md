@@ -15,6 +15,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
+| `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -41,6 +42,17 @@ Generated meshes are about 300k faces with textures baked for that mesh. For a g
 
 Quad remeshing uses [Instant Meshes](https://github.com/wjakob/instant-meshes) (BSD) through `pynanoinstantmeshes` in the MCP venv. Blender's own Quadriflow is the fallback but rejects many generated meshes, so expect `decimate` results if that package is missing. Blender (4.2 or later, any build) must be installed; `LOCALGEN_BLENDER` points at a specific one.
 
+### Texturing
+
+`texture_mesh` gives any mesh a PBR material, using native ComfyUI nodes and FLUX.2 Klein:
+1. **UVs:** `UnwrapMesh` makes a fresh UV layout; `keep_uvs=True` keeps the mesh's own.
+2. **Clay renders:** `RenderMesh` draws grey clay views from `views` cameras around the mesh, framed to its bounding sphere and tilted 20 degrees.
+3. **Painting:** Klein paints each view image to image. It starts from the clay render's own latent with partial `denoise`, which holds the painting to the geometry; from an empty latent it drifts back to a front view, and the back of the mesh gets a face. `style_image` guides the front view.
+4. **Projection:** `BakeTextureFromViews` projects the painted views into the UVs, each limited to its silhouette, and fills texels no view sees. `BakeAmbientOcclusion` adds AO.
+5. **Blender (CPU):** adds a tangent space normal map baked from a bump of the painted detail, a roughness map (rougher where the paint is darker) and metallic, then writes the GLB and an FBX.
+
+Limits: every view is painted separately, so the views can disagree on details. Parts seen only edge-on, or only from above, get filled or blended colour. It works best on clean meshes of a few thousand to 50k faces, such as `retopologize_mesh` output.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -55,7 +67,7 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 | Use | Model | License | Download |
 |---|---|---|---|
 | Text to image | Z-Image Turbo 6B bf16 | Apache 2.0 | 18.28 GB (with its text encoder and VAE) |
-| Image editing, reference images | FLUX.2 Klein 4B fp8 | Apache 2.0 | 12.45 GB (includes the full Qwen3 4B text encoder) |
+| Image editing, reference images; painting views for `texture_mesh` | FLUX.2 Klein 4B fp8 | Apache 2.0 | 12.45 GB (includes the full Qwen3 4B text encoder) |
 | Video | Wan 2.2 TI2V 5B fp16 | Apache 2.0 | 18.15 GB |
 | Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
 | Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
@@ -79,6 +91,7 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, four views | Pixal3D multi-view, same settings | 63 to 83 s (GLB about 17 MB) | 11.1 GB |
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
+| Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.

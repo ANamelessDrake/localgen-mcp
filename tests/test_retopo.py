@@ -40,7 +40,7 @@ def test_rejects_bad_arguments(tmp_path, faces, method, tex):
 
 
 def test_command_runs_the_bundled_script_with_this_interpreter(settings, tmp_path, monkeypatch):
-    monkeypatch.setattr(retopo.shutil, "which", lambda name: "/usr/bin/true")
+    monkeypatch.setattr(retopo.blender_run.shutil, "which", lambda name: "/usr/bin/true")
     cmd = retopo.command(settings, tmp_path / "in.glb", tmp_path / "out.glb", 8000, "quad", 1024)
     assert cmd[0] == "/usr/bin/true"
     assert cmd[cmd.index("-t") + 1] == "4"

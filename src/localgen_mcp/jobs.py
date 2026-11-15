@@ -50,6 +50,51 @@ def is_image_file(path: Path) -> bool:
     return any(head.startswith(m) for m in _IMAGE_MAGIC)
 
 
+MESH_SUFFIXES = (".glb", ".gltf", ".obj", ".stl")
+
+
+def is_mesh_file(path: Path) -> bool:
+    """A 3D model Get3DComponents reads, checked by content so arbitrary files are never uploaded:
+    binary glTF by signature, glTF as JSON with an "asset" entry, binary STL by its exact size,
+    ASCII STL and OBJ by their keywords."""
+    suffix = path.suffix.lower()
+    with open(path, "rb") as f:
+        head = f.read(65536)
+    if suffix == ".glb":
+        return head[:4] == b"glTF"
+    if suffix == ".gltf":
+        return head.lstrip().startswith(b"{") and b'"asset"' in head
+    if suffix == ".stl":
+        if head[:5] == b"solid" and b"facet" in head:
+            return True
+        if len(head) >= 84:
+            count = int.from_bytes(head[80:84], "little")
+            return path.stat().st_size == 84 + 50 * count
+        return False
+    if suffix == ".obj":
+        keys = {"v", "vn", "vt", "f", "o", "g", "s", "mtllib", "usemtl", "#"}
+        lines = [ln.split(maxsplit=1) for ln in head.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+        return bool(lines) and all(ln[0] in keys or ln[0].startswith("#") for ln in lines[:-1]) \
+            and any(ln[0] == "v" for ln in lines)
+    return False
+
+
+def placeholder_png(path: Path) -> Path:
+    """An 8x8 black PNG, written once (Load3D wants viewport images even when run headless)."""
+    if not path.exists():
+        import struct
+        import zlib
+
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        raw = b"".join(b"\0" + b"\0\0\0" * 8 for _ in range(8))
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(png)
+    return path
+
+
 def default_output_dir(settings: Settings, modality: str) -> Path:
     return settings.output_dir / modality / dt.date.today().isoformat()
 
@@ -63,6 +108,7 @@ async def run_workflow(
     images: dict[str, str] | None = None,
     timeout: float = 1800,
     progress: Progress | None = None,
+    mesh: str | None = None,
 ) -> dict:
     """Run one graph per entry of jobs (parameter overrides) and return file paths.
 
@@ -81,8 +127,8 @@ async def run_workflow(
 
     missing = workflow.missing_models(settings.comfy_dir / "models")
     if missing:
-        raise JobError(f"{workflow.name} is missing model files {missing}; run "
-                       f"setup/download-models.sh --only {workflow.modality}")
+        files = " ".join(f"--file {Path(m).name}" for m in missing)
+        raise JobError(f"{workflow.name} is missing model files {missing}; run setup/download-models.sh {files}")
 
     image_paths: dict[str, Path] = {}
     for slot, raw in (images or {}).items():
@@ -101,6 +147,15 @@ async def run_workflow(
     if len(image_paths) < workflow.min_images:
         raise JobError(f"{workflow.name} needs at least {workflow.min_images} input image(s) "
                        f"in slots {list(workflow.image_slots)}")
+    mesh_path = None
+    if workflow.needs_mesh:
+        if not mesh:
+            raise JobError(f"{workflow.name} needs an input mesh")
+        mesh_path = Path(mesh).expanduser().resolve()
+        if not mesh_path.is_file():
+            raise JobError(f"input mesh not found: {mesh_path}")
+        if mesh_path.suffix.lower() not in MESH_SUFFIXES or not is_mesh_file(mesh_path):
+            raise JobError(f"not a GLB, glTF, OBJ or STL model: {mesh_path} (convert FBX to GLB first)")
 
     params_list = []
     base_seed = None
@@ -127,6 +182,12 @@ async def run_workflow(
                         for slot, path in image_paths.items()}
             for p in params_list:
                 p["images"] = uploaded
+        if mesh_path is not None:
+            name = await asyncio.to_thread(client.upload_image, mesh_path, "3d/localgen")
+            placeholder = await asyncio.to_thread(
+                client.upload_image, placeholder_png(settings.root / "tmp" / "localgen_placeholder.png"))
+            for p in params_list:
+                p["mesh"], p["placeholder"] = name, placeholder
         backend.touch_activity(settings)
         ids = []
         for p in params_list:
@@ -175,7 +236,8 @@ async def run_workflow(
                     "paths": paths,
                     "seed": p["seed"],
                     "exec_seconds": _exec_seconds(entry),
-                    "settings": {k: v for k, v in p.items() if k not in ("prefix", "images", "prompt", "negative_prompt")},
+                    "settings": {k: v for k, v in p.items()
+                                 if k not in ("prefix", "images", "prompt", "negative_prompt", "mesh", "placeholder")},
                 }
                 done = sum(r is not None for r in results)
                 await report(done, len(results), f"{done}/{len(results)} done")
@@ -198,6 +260,7 @@ async def run_workflow(
         "modality": workflow.modality,
         "prompt": params_list[0].get("prompt"),
         "input_images": {slot: str(path) for slot, path in image_paths.items()} or None,
+        **({"input_mesh": str(mesh_path)} if mesh_path is not None else {}),
         "outputs": results,
         "paths": [p for r in results for p in r["paths"]],
         "output_dir": str(outdir),

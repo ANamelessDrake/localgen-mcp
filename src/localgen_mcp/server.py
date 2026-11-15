@@ -18,10 +18,11 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, config, jobs, retopo, workflows
+from . import backend, blender_run, config, jobs, retopo, workflows
 
 
 def _configure_logging() -> logging.Logger:
@@ -241,6 +242,59 @@ async def retopologize_mesh(
     Returns the path, face and vertex counts before and after, the method that ran and timings.
     """
     return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir)
+
+
+@mcp.tool()
+async def texture_mesh(
+    input_mesh: str,
+    prompt: str,
+    style_image: str | None = None,
+    views: int = 4,
+    texture_size: int = 2048,
+    denoise: float = 0.9,
+    bump: float = 0.5,
+    roughness: float = 0.6,
+    metallic: float = 0.0,
+    keep_uvs: bool = False,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Texture an existing mesh (GLB, glTF, OBJ or STL; untextured is fine) from a text prompt.
+
+    Builds everything a PBR material needs: a fresh UV layout (keep_uvs=True keeps the mesh's own),
+    a base color painted by FLUX.2 Klein on `views` clay renders around the mesh and projected into
+    the UVs (style_image: an optional picture whose colours and style the front view follows),
+    ambient occlusion, a normal map from a bump derived from the painted detail (bump 0 to 1, 0 for
+    none), and roughness (base value, rougher where the paint is darker) and metallic values.
+    denoise (0.6 to 1.0) is how freely views are painted: lower keeps more of the clay shading.
+    Best on clean meshes of a few thousand to 50k faces, for example from retopologize_mesh.
+    Outputs a GLB and an FBX with embedded textures, plus the painted views as PNGs. About 1 to 2
+    minutes on the GPU, then a few seconds in Blender on the CPU.
+    """
+    if not 0.6 <= denoise <= 1.0:
+        raise ValueError("denoise must be between 0.6 and 1.0")
+    if not (0.0 <= bump <= 1.0 and 0.0 <= roughness <= 1.0 and 0.0 <= metallic <= 1.0):
+        raise ValueError("bump, roughness and metallic must be between 0 and 1")
+    wf = workflows.get("texture")
+    overrides = {"prompt": prompt, "views": views, "texture_size": texture_size, "denoise": denoise,
+                 "unwrap": not keep_uvs, "seed": seed}
+    images = {"style": style_image} if style_image else None
+    logger.info("texture_mesh: %s (%s)", input_mesh, wf.name)
+    result = await jobs.run_workflow(settings, wf, [overrides], output_dir, idle_timeout_seconds, images=images,
+                                     timeout=TIMEOUTS["mesh"], progress=_progress(ctx), mesh=input_mesh)
+    glb = next(Path(p) for p in result["paths"] if p.endswith(".glb"))
+    final = glb.with_name(glb.stem + "_pbr.glb")
+    maps = await blender_run.run(settings, "texture_maps.py", [glb, final, bump, roughness, metallic],
+                                 "TEXTURE_MAPS_RESULT", final)
+    glb.unlink(missing_ok=True)  # the intermediate (base color and AO only); the _pbr GLB supersedes it
+    result["views"] = [p for p in result["paths"] if p.endswith(".png")]
+    result["paths"] = [str(final), maps["fbx"]] + result["views"]
+    result["textured_mesh"] = str(final)
+    result["fbx"] = maps["fbx"]
+    result["maps"] = maps
+    return result
 
 
 # -- backend control ------------------------------------------------------
