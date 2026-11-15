@@ -8,7 +8,7 @@ model and the alpha channel bilinearly, so alpha is kept by joining LoadImage's
 mask back onto the image first.
 
 Both models are 4x. For 2x the 4x result is downscaled by half with Lanczos,
-which keeps more detail than a 2x model run on the original.
+so one model file serves both scales.
 """
 
 from __future__ import annotations

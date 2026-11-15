@@ -554,13 +554,14 @@ async def upscale_image(
 
     model: "realesrgan-x4plus" (default; general purpose, suits concept art, renders and photos, and
     cleans up mild noise and JPEG artefacts) or "pbrify-v4" (made for game textures such as albedo,
-    roughness or normal maps; keeps fine surface detail; about 4 times slower).
+    roughness or normal maps; keeps fine surface detail; about 3 times slower).
     scale: 4 (the models' native scale) or 2 (the 4x result downscaled by half with Lanczos).
     keep_alpha: a PNG with transparency keeps it; the alpha channel is upscaled smoothly, the colour
     by the model. keep_alpha=False writes an opaque RGB PNG.
     Large images are processed in tiles inside the backend, so any size fits in VRAM; the result is
     limited to 8192 px per side (for example 2048 px at 4x, 4096 px at 2x) and is an 8-bit PNG.
-    Roughly 1 to 3 s per megapixel of output with the default model on this GPU.
+    Measured on this GPU: about 0.5 s per megapixel of 4x output with the default model and 1.5 s
+    with pbrify-v4 (a 1024 px image takes about 9 s and 25 s), plus any wait for the shared queue.
     Output: <output_dir or /ai/output/localgen/upscale/<date>>/<input name>_x<scale>.png.
     Returns the path, input and output sizes, whether alpha was kept, and timings.
     """
