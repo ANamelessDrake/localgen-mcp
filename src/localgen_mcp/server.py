@@ -26,7 +26,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, jobs, model_files, retopo, workflows
+from . import backend, blender_run, config, jobs, model_files, retopo, rig, workflows
 from .workflows.part_isolate import part_prompt
 
 
@@ -258,6 +258,54 @@ async def retopologize_mesh(
     """
     return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir,
                                      detail, detail_strength)
+
+
+@mcp.tool()
+async def rig_creature(
+    input_mesh: str,
+    preset: str = "auto",
+    bones: int | None = None,
+    axis: str | list[float] | None = None,
+    root_end: str | list[float] | None = None,
+    wing_chains: int = 3,
+    wing_bones: int = 4,
+    weights: str = "auto",
+    name: str | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    """Soft rig for an organic creature (tentacles, tails, vines, rays, fish): bone chains with smooth skin
+    weights, so engine scripts or physics (Verlet, springs) can bend it. No animation clips are made.
+
+    Call it on a clean mesh: run retopologize_mesh first (generated meshes are about 300k faces with
+    stray shells; a quad retopology of 5k to 20k faces skins and deforms far better). input_mesh: a GLB.
+    preset:
+      "chain": one chain of `bones` (default 8) along the mesh's main axis, or `axis`; for tentacles,
+        tails, vines. Bones are named <name>_01.. from the root (name default "tentacle").
+      "spine": the same along the body, named spine_01.. (default 6 bones).
+      "wings": stingray, manta, bat or bird: a spine along the body length (`bones`, default 6) and,
+        on each side, `wing_chains` (default 3) chains of `wing_bones` (default 4) fanning from the body
+        to the wing edge. Named spine_01.., wing_L1_01.. and the mirrored wing_R1_01.. (L is the
+        positive side of the left-right axis: +X when that is X, the creature's left when it faces -Y as
+        generated meshes do; chain 1 is nearest the head).
+      "auto" (default): chain if long and thin, wings if flat and broad, else spine; the report says
+        which and why.
+    axis: "x", "y", "z" or [x, y, z]: the chain direction, or the body length for "wings"
+    (default: from the mesh's principal axes; for wings, the left-right axis is the one the mesh is
+    mirror symmetric across).
+    root_end: which end the chain (or the spine, at the head) starts from: "min" or "max" along the
+    axis, or a point [x, y, z] (the end nearest it). Default: a vertical chain starts at its lower end,
+    otherwise at the thicker end (a tentacle's base); wings start at the wider end (a tail is narrow).
+    weights: "auto" tries Blender's heat weights and falls back to a smooth distance falloff from the
+    bones when they fail (more than 1% of the vertices unweighted or on a far bone, common on generated
+    meshes); "distance" always uses the falloff. Every vertex gets at most 4 influences, normalised.
+    Bone axes: local Y runs along each bone; rotate about local X to bend (for wings, local Z is the
+    surface normal, so local X rotation flaps up and down).
+    Output: <output_dir or the input's folder>/<input name>_rig_<preset>.glb and .fbx (armature and skinned
+    mesh, rest pose). Returns the bones (head, tail, parent), the preset used, weight coverage and
+    method, and warnings. Headless Blender on the CPU, a few seconds.
+    """
+    return await rig.rig_creature(settings, input_mesh, preset, bones, axis, root_end, wing_chains, wing_bones,
+                                  weights, name, output_dir)
 
 
 def _reuse_file(root: Path, entry, kind: str) -> str | None:
