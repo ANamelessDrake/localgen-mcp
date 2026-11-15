@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "localgen": {
+      "command": "/ai/venvs/localgen-mcp/bin/python",
+      "args": ["-m", "localgen_mcp.server"],
+      "env": {
+        "LOCALGEN_ROOT": "/ai",
+        "LOCALGEN_IDLE_TIMEOUT": "300"
+      }
+    }
+  }
+}

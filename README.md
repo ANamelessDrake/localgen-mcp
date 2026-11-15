@@ -1,0 +1,146 @@
+# localgen-mcp
+
+A local MCP server that lets agents generate images, video and 3D meshes on this machine's GPU, fully offline, through one shared [ComfyUI](https://github.com/comfyanonymous/ComfyUI) backend that starts on demand and shuts itself down when idle.
+
+- **Localhost and offline only.** The managed ComfyUI binds `127.0.0.1` and always runs with `--offline` (no partner or API nodes, a restrictive CSP for its frontend). Hub lookups are disabled with `HF_HUB_OFFLINE=1`. The network is used only by the setup scripts, to fetch software and weights.
+- **Nothing resident when idle.** The MCP server imports no ML libraries. ComfyUI runs only while there is work, and its process is killed after the idle timeout (default 300 s), which releases all VRAM and RAM.
+- **One backend for every agent.** Each agent session runs its own MCP server process; they all share a single ComfyUI instance, coordinated with file locks.
+- **Returns file paths**, plus the seed and settings used, so results can be reproduced.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `generate_image` | Text to image (Z-Image Turbo). With `reference_images` (up to 4 paths), edits or combines them as the prompt says (FLUX.2 Klein 4B). `count` queues several at once with one model load. |
+| `generate_video` | Text to video, or image to video with `input_image` as the first frame (Wan 2.2 TI2V 5B, MP4). |
+| `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view). |
+| `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
+| `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
+| `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
+
+Every generation tool takes optional `output_dir`, `seed`, `model` and `idle_timeout_seconds`. Outputs default to `/ai/output/localgen/<modality>/<date>/`. Long jobs send MCP progress notifications.
+
+### Idle timeout
+
+- Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
+- The call that starts the backend sets the timeout. While it runs, a longer request extends it and a shorter one is ignored: the effective value is the maximum requested since it started, so one agent cannot cut short another's batch.
+- The effective value is in every tool result and in `status`.
+- Idle means an empty ComfyUI queue and no client activity for that long.
+
+## Models
+
+Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside a desktop session). Reasons, rejected candidates and sources are in [docs/model-choices.md](docs/model-choices.md).
+
+| Use | Model | License | Download |
+|---|---|---|---|
+| Text to image | Z-Image Turbo 6B bf16 | Apache 2.0 | 18.28 GB (with its text encoder and VAE) |
+| Image editing, reference images | FLUX.2 Klein 4B fp8 | Apache 2.0 | 12.45 GB (includes the full Qwen3 4B text encoder) |
+| Video | Wan 2.2 TI2V 5B fp16 | Apache 2.0 | 18.15 GB |
+| Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
+| Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
+
+All of them use native ComfyUI nodes; no custom nodes are installed.
+
+<!-- MEASURED -->
+
+## Install or rebuild
+
+Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12.
+
+```bash
+setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
+setup/install.sh --root /ai --dry-run  # show what would be done, change nothing
+setup/install.sh --skip-models         # software only
+setup/download-models.sh --only video  # weights for one group (image, video, mesh); --verify rechecks SHA256
+```
+
+What gets pinned:
+- ComfyUI at commit `e08cc003` (0.45.0).
+- Both venvs from frozen lock files (`setup/comfyui-requirements.lock`, `setup/mcp-requirements.lock`).
+- Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`).
+
+Everything large lives under the install root: weights, venvs, uv's cache and managed Pythons, logs, outputs and temp files. Nothing goes in `/tmp` or the home directory. The scripts are idempotent; rerun them after an interruption.
+
+### MCP client config
+
+`setup/register-mcp.sh` prints the block below and keeps a copy in [claude-mcp-config.json](claude-mcp-config.json). It does not install it anywhere; add it to your MCP client's config yourself.
+
+```json
+{
+  "mcpServers": {
+    "localgen": {
+      "command": "/ai/venvs/localgen-mcp/bin/python",
+      "args": ["-m", "localgen_mcp.server"],
+      "env": {
+        "LOCALGEN_ROOT": "/ai",
+        "LOCALGEN_IDLE_TIMEOUT": "300"
+      }
+    }
+  }
+}
+```
+
+## How it works
+
+```
+agent A ── MCP server ─┐                                   ┌─ ComfyUI 127.0.0.1:8188 --offline
+agent B ── MCP server ─┼─ flock start.lock ─ supervisor ───┤   (child process, killed when idle)
+agent C ── MCP server ─┘   touch last_activity             └─ reads idle_timeout every poll
+```
+
+- `backend.ensure_backend()` takes an exclusive lock on `<root>/run/localgen/start.lock`. If ComfyUI answers, it is used. Otherwise a detached supervisor is started (its own session, logs in `<root>/logs`), and the caller waits for `/system_stats`. Concurrent cold calls therefore start exactly one backend.
+- The supervisor holds `supervisor.lock` for its lifetime and runs ComfyUI as its child, which gets SIGTERM if the supervisor dies. It polls `/queue` and the mtime of `last_activity`, which clients touch before and during every job.
+- To shut down, the supervisor takes `start.lock` (so no client can submit into a dying server) and rechecks for activity. It then terminates ComfyUI (SIGTERM, then SIGKILL after a grace period) and clears its run state.
+- If a ComfyUI that localgen did not start is already on the port (for example one started by hand), it is used as is and never stopped.
+
+Run state, all under `<root>/run/localgen`: `start.lock`, `supervisor.lock`, `supervisor.pid`, `last_activity`, `idle_timeout`.
+
+## Configuration
+
+| Variable | Default | |
+|---|---|---|
+| `LOCALGEN_ROOT` | `/ai` | Install root |
+| `LOCALGEN_COMFY_DIR` | `<root>/ComfyUI` | |
+| `LOCALGEN_HOST`, `LOCALGEN_PORT` | `127.0.0.1`, `8188` | Non-loopback hosts are rejected |
+| `LOCALGEN_IDLE_TIMEOUT` (`_MIN`, `_MAX`) | 300 (60, 7200) s | |
+| `LOCALGEN_START_TIMEOUT` | 180 s | Wait for ComfyUI to answer |
+| `LOCALGEN_TIMEOUT_IMAGE`, `_VIDEO`, `_MESH` | 900, 5400, 3600 s | Per job |
+| `LOCALGEN_COMFY_ARGS` | | Extra ComfyUI flags, for example `--lowvram` |
+| `LOCALGEN_OUTPUT_DIR`, `LOCALGEN_LOG_DIR`, `LOCALGEN_RUN_DIR` | under the root | |
+| `LOCALGEN_MCP_LOG_LEVEL`, `LOCALGEN_MCP_LOG_FILE` | `INFO` | Server logs go to stderr |
+
+## Adding a model
+
+1. Add its files to `setup/models.manifest`: group, target path, Hugging Face repo, pinned revision, path in the repo, size and SHA256 (all from `https://huggingface.co/api/models/<repo>/revision/<rev>?blobs=true`).
+2. Add a module under `src/localgen_mcp/workflows/` defining `WORKFLOW = Workflow(...)`: modality, model files, defaults, limits, named `image_slots`, and a `build(params)` function returning an API format graph. List it in `_MODULES`.
+   - ComfyUI's bundled templates are UI format; `python -m localgen_mcp.ui_to_api` converts them headless, and `scripts/make_trellis2_workflow.py` is a worked example.
+3. Tools choose a workflow by modality and by which image slots the caller filled, so a new model is reachable through `model=` without touching the server. A new modality also needs a tool in `server.py`.
+
+## Development
+
+```bash
+uv venv --python 3.12 /ai/venvs/localgen-mcp
+uv pip install --python /ai/venvs/localgen-mcp/bin/python -r setup/mcp-requirements.lock -e .
+/ai/venvs/localgen-mcp/bin/python -m pytest      # no GPU needed: the backend tests run against a fake ComfyUI
+scripts/mcp_call.py --list                       # talk to the server over stdio like an MCP client would
+scripts/mcp_call.py generate_image '{"prompt": "a red apple"}'
+```
+
+The backend tests launch the real supervisor against `tests/fake_comfy/main.py`, a stand-in that answers the same endpoints and records its command line. They cover:
+- the cold start, which must bind to localhost and run with `--offline`;
+- reuse of a running backend;
+- timeout extension and clamping;
+- idle shutdown on a custom timeout;
+- an extension from a second process being honoured;
+- a busy queue keeping the backend up;
+- four concurrent cold callers starting exactly one backend;
+- `stop_backend` guarding a busy queue;
+- an unmanaged ComfyUI being left alone.
+
+## Credits
+
+The server skeleton (FastMCP, stderr logging, signal handling) follows the layout of the author's other MCP servers. The ComfyUI client and the Z-Image Turbo graph are ported from a standalone Z-Image CLI written for the same install. Workflow graphs follow ComfyUI's own templates.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Model weights are under their own licenses, listed above.
