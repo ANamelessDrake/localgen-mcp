@@ -27,6 +27,7 @@ from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
 
 from . import backend, blender_run, config, cutout, jobs, model_files, retopo, rig, speech, workflows
+from .workflows.image_edit import edit_images
 from .workflows.part_isolate import part_prompt
 
 
@@ -97,6 +98,9 @@ async def generate_image(
     seed: int | None = None,
     steps: int | None = None,
     reference_images: list[str] | None = None,
+    input_image: str | None = None,
+    denoise: float | None = None,
+    mask_image: str | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
     model: str | None = None,
@@ -109,6 +113,22 @@ async def generate_image(
     with them (for example "change the jacket to red", "the person from image 1 in the setting of
     image 2"). This uses FLUX.2 Klein 4B; output size follows the first reference unless width and
     height are given.
+    input_image: a local image to start from (image to image) instead of noise. The output keeps
+    its size (width and height are not allowed); it is worked on at about 1 megapixel. The prompt
+    describes the whole desired result, not only the change.
+    denoise (0.05 to 1.0, needs input_image): how much may change. Z-Image Turbo default 0.6.
+    Z-Image holds on to the input strongly: 0.3 and 0.6 change only fine detail, 0.9 keeps the
+    layout but changes colours and materials, 1.0 ignores the input (except outside a mask).
+    mask_image (needs input_image): a black and white image, white = change, black = keep; any
+    size (it is stretched to input_image). Only the white area is regenerated, and the result is
+    pasted back over input_image with an 8 pixel feathered edge, so every pixel more than about
+    18 px outside the white area is exactly the original. To replace what is in the region use
+    denoise 1.0; to recolour an object, Klein (model="flux2-klein-4b") follows the prompt better
+    than Z-Image at 0.9, which keeps some of the old colour.
+    input_image with reference_images (or model="flux2-klein-4b"): FLUX.2 Klein edits input_image
+    as image 1 and the references are images 2 to 4 (at most 3), for example "give the person in
+    image 1 the hat from image 2"; Klein's denoise default is 1.0 (a full edit guided by image 1),
+    and mask_image limits it to a region the same way.
     count > 1 queues all images at once (one model load); seeds are seed, seed+1, ...
     Returns absolute PNG paths, the seeds and settings used, timings and the effective
     backend idle timeout. Default output folder: /ai/output/localgen/image/<date>/.
@@ -117,11 +137,12 @@ async def generate_image(
     if not 1 <= count <= 64:
         raise ValueError("count must be between 1 and 64")
     refs = [r for r in (reference_images or []) if r]
-    images = {f"ref{i + 1}": path for i, path in enumerate(refs)}
+    images = edit_images(input_image, mask_image, refs, denoise, width, height)
     wf = workflows.pick("image", model, set(images))
-    overrides = {"prompt": prompt, "width": width, "height": height, "steps": steps}
+    overrides = {"prompt": prompt, "width": width, "height": height, "steps": steps, "denoise": denoise}
     job_list = [dict(overrides, seed=None if seed is None else seed + i) for i in range(count)]
-    logger.info("generate_image: %d x %r refs=%d (%s)", count, prompt[:80], len(refs), wf.name)
+    logger.info("generate_image: %d x %r refs=%d image=%s mask=%s (%s)", count, prompt[:80], len(refs),
+                input_image, mask_image, wf.name)
     return await jobs.run_workflow(settings, wf, job_list, output_dir, idle_timeout_seconds,
                                    images=images, timeout=TIMEOUTS["image"], progress=_progress(ctx))
 
