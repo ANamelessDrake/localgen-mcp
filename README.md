@@ -17,6 +17,8 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
 | `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
+| `speak` | Text to speech for game dialogue (Kokoro-82M, English, on the CPU): 24 kHz WAV plus OGG, in one of 28 voices or a blend, with an optional `effect` (`radio`, `robotic`, `glitch` for a voice struggling on low power). Needs `install.sh --with-tts`. |
+| `list_voices` | The installed voices (accent, gender, quality grade), the effects, and whether ffmpeg was found. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -72,6 +74,21 @@ Limits: every view is painted separately, so the views can disagree on details. 
 - **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
 - **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
+### Speech
+
+`speak` turns one line of English into a WAV file for game dialogue. It does not use ComfyUI or the GPU, so it runs beside image and video jobs.
+- **Model:** Kokoro-82M v1.0 (Apache 2.0) on the CPU, in its own venv (`<root>/venvs/localgen-tts`). The MCP server runs `src/localgen_mcp/tts/runner.py` with that venv's Python and reads its final `TTS_RESULT {json}` line, the same pattern as the Blender scripts. The runner gets `HF_HUB_OFFLINE=1` and a CPU only PyTorch build.
+- **Time:** about 5 s per line on 4 threads, most of it loading the model; each call starts a fresh process, so nothing stays in memory.
+- **Voices:** 20 American and 8 British English voices; `list_voices` gives Kokoro's quality grade for each (`af_heart` A, `af_bella` A-, `bf_emma` and `af_nicole` B-, the male voices C+ at best). A comma separated list of up to 4 voices with one accent is averaged into a new voice.
+- **Effects** (ffmpeg filter graphs in `tts/effects.py`; `intensity` 0 to 1 scales each):
+  - `radio`: band limited to about 300 to 3200 Hz, compressed, light crushing and hiss.
+  - `robotic`: a constant phase spectrum (a flat, buzzing monotone) with a short metallic echo.
+  - `glitch`: for the low power lines. Stutters repeat the onset of some words (placed with the model's word timings), with dropouts, bursts of heavy bit crushing and light crushing throughout. `seed` reproduces a take.
+  - The effected take is brought back to the dry take's peak level, and the dry take is kept as `<name>_dry.wav`.
+  - Without ffmpeg, the runner renders approximations with numpy and writes WAV only.
+- **Output:** 24 kHz mono 16 bit WAV and an OGG Vorbis copy, named by `name` (for example `pathfinder_hull_40_lowpower`). The result gives the duration, sample rate, RMS and peak level, and word timings (usable for subtitles).
+- **Limits:** English only. Very short lines (a word or two) are weaker; Kokoro's model card suggests bundling them. No voice cloning; see [docs/model-choices.md](docs/model-choices.md) for why Chatterbox was not chosen. Levels and durations are checked automatically; only a listener can judge the voice itself.
+
 ### Idle timeout
 
 - Default 300 s, bounded to 60 to 7200 s (`LOCALGEN_IDLE_TIMEOUT`, `LOCALGEN_IDLE_TIMEOUT_MIN`, `LOCALGEN_IDLE_TIMEOUT_MAX`).
@@ -90,6 +107,7 @@ Chosen for a 12 GB card (an RTX 3080 Ti, with about 7.8 GB actually free beside 
 | Video | Wan 2.2 TI2V 5B fp16 | Apache 2.0 | 18.15 GB |
 | Mesh from one image | TRELLIS.2 4B int8 | MIT | 8.96 GB |
 | Mesh from several views | Pixal3D multi-view int8 | MIT | 5.58 GB (shares the TRELLIS.2 files) |
+| Speech (optional, CPU) | Kokoro-82M v1.0, 28 English voices | Apache 2.0 | 0.34 GB, plus a 1.3 GB venv |
 
 All of them use native ComfyUI nodes; no custom nodes are installed.
 
@@ -111,6 +129,7 @@ Measured through the MCP server over stdio, with all models in one backend sessi
 | Mesh, three views from a turnaround sheet | Pixal3D multi-view, `framing="crop"` | 74 to 96 s | |
 | Retopology | 300k faces to 10k quads, 2048 px textures | 10 to 13 s (CPU) | none |
 | Texture a mesh, warm | 4 views at 1024 px, 2048 px textures, 10k quad mesh | 34 s, plus 4 s in Blender | |
+| Speech, one 4 to 6 s line (measured with the load average near 10) | Kokoro-82M, 4 CPU threads, any effect | about 5 s in the runner (mostly model load); 6 to 10 s per call over MCP | none (CPU) |
 | Idle shutdown | default 300 s | ComfyUI gone at 301 s idle; VRAM back to 3.6 GB, RAM freed (about 18 GB) | |
 
 Times include the model swap when the previous job used a different model.
@@ -119,19 +138,21 @@ Mesh quality was checked by rendering each GLB from the four rig views in Blende
 
 ## Install or rebuild
 
-Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found.
+Requirements: Linux, an NVIDIA GPU and driver, `git` and [`uv`](https://docs.astral.sh/uv/). uv provides Python 3.12. Blender is optional: only retopology needs it, and `install.sh` reports whether it was found. ffmpeg is optional too: `speak` uses it for effects and OGG output.
 
 ```bash
 setup/install.sh --root /ai            # ComfyUI, both venvs, directories, all model weights
 setup/install.sh --root /ai --dry-run  # show what would be done, change nothing
 setup/install.sh --skip-models         # software only
 setup/download-models.sh --only video  # weights for one group (image, video, mesh); --verify rechecks SHA256
+setup/install.sh --root /ai --with-tts # also the text to speech venv (CPU) and the Kokoro weights
 ```
 
 What gets pinned:
 - ComfyUI at commit `e08cc003` (0.45.0).
 - Both venvs from frozen lock files (`setup/comfyui-requirements.lock`, `setup/mcp-requirements.lock`).
 - Every weight file by Hugging Face revision and SHA256 (`setup/models.manifest`).
+- With `--with-tts`: the text to speech venv from `setup/tts-requirements.lock` (every package hashed, CPU only PyTorch) and the Kokoro files in `setup/tts.manifest`, into `<root>/models/tts`.
 
 Everything large lives under the install root: weights, venvs, uv's cache and managed Pythons, logs, outputs and temp files. Nothing goes in `/tmp` or the home directory. The scripts are idempotent; rerun them after an interruption.
 
@@ -185,6 +206,11 @@ Run state, all under `<root>/run/localgen`: `start.lock`, `supervisor.lock`, `su
 | `LOCALGEN_BLENDER` | `blender` on `PATH` | For retopology |
 | `LOCALGEN_BLENDER_THREADS` | 8 | CPU threads for Blender's bake |
 | `LOCALGEN_TIMEOUT_RETOPO` | 1800 s | |
+| `LOCALGEN_TTS_PYTHON` | `<root>/venvs/localgen-tts/bin/python` | Text to speech venv |
+| `LOCALGEN_TTS_MODEL_DIR` | `<root>/models/tts/kokoro-82m` | |
+| `LOCALGEN_TTS_THREADS` | 4 | CPU threads for synthesis |
+| `LOCALGEN_TIMEOUT_TTS` | 600 s | |
+| `LOCALGEN_FFMPEG` | `ffmpeg` on `PATH` | Effects and OGG output |
 
 ## Adding a model
 
