@@ -53,6 +53,33 @@ def validate(input_mesh: str, target_faces: int, method: str, texture_size: int,
     return path
 
 
+MAX_LODS = 8
+
+
+def validate_lods(lods) -> list[int] | None:
+    """lods: face budgets for LOD0, LOD1, ...; each in FACE_RANGE and strictly smaller than the one before."""
+    if lods is None:
+        return None
+    if isinstance(lods, (str, bytes)) or not isinstance(lods, (list, tuple)) or not 1 <= len(lods) <= MAX_LODS:
+        raise RetopoError(f"lods must be a list of 1 to {MAX_LODS} face counts, for example [10000, 3000, 800]")
+    out = []
+    lo, hi = FACE_RANGE
+    for f in lods:
+        if isinstance(f, bool) or not isinstance(f, (int, float)) or int(f) != f:
+            raise RetopoError(f"lods entries must be whole face counts, got {f!r}")
+        if not lo <= int(f) <= hi:
+            raise RetopoError(f"lods entries must be in {lo}..{hi}")
+        if out and int(f) >= out[-1]:
+            raise RetopoError("lods must be strictly decreasing (LOD0 has the most faces)")
+        out.append(int(f))
+    return out
+
+
+def lod_object_name(src: Path) -> str:
+    """The base object name for <name>_LOD0, <name>_LOD1, ... (letters, digits and underscores)."""
+    return re.sub(r"[^A-Za-z0-9_]+", "_", src.stem).strip("_")[:48] or "mesh"
+
+
 def detail_for(method: str, detail: str | None) -> str:
     """Detail weighting applies to decimation only (the quad remeshers have one density everywhere)."""
     if method != "decimate":
@@ -61,15 +88,19 @@ def detail_for(method: str, detail: str | None) -> str:
 
 
 def script_args(src: Path, dst: Path, target_faces: int, method: str, texture_size: int,
-                detail: str | None = None, detail_strength: float = 1.0) -> list:
-    return [src, dst, int(target_faces), method, int(texture_size), blender_run.PYTHON,
+                detail: str | None = None, detail_strength: float = 1.0, lods: list[int] | None = None) -> list:
+    args = [src, dst, int(target_faces), method, int(texture_size), blender_run.PYTHON,
             detail_for(method, detail), float(detail_strength)]
+    if lods:
+        args += [",".join(str(int(f)) for f in lods), lod_object_name(src)]
+    return args
 
 
 def command(settings: Settings, src: Path, dst: Path, target_faces: int, method: str,
-            texture_size: int, detail: str | None = None, detail_strength: float = 1.0) -> list[str]:
-    return blender_run.command(settings, "retopo.py",
-                               script_args(src, dst, target_faces, method, texture_size, detail, detail_strength))
+            texture_size: int, detail: str | None = None, detail_strength: float = 1.0,
+            lods: list[int] | None = None) -> list[str]:
+    return blender_run.command(settings, "retopo.py", script_args(src, dst, target_faces, method, texture_size,
+                                                                  detail, detail_strength, lods))
 
 
 def parse_report(stdout: str) -> dict:
@@ -83,18 +114,27 @@ def output_name(src: Path, suffix: str) -> str:
 async def retopologize(settings: Settings, input_mesh: str, target_faces: int = 10000,
                        method: str = "quad", texture_size: int = 2048,
                        output_dir: str | None = None, detail: str | None = None,
-                       detail_strength: float = 1.0) -> dict:
+                       detail_strength: float = 1.0, lods: list[int] | None = None) -> dict:
+    lods = validate_lods(lods)
+    if lods:
+        target_faces = lods[0]  # LOD0 is the retopology itself
     src = validate(input_mesh, target_faces, method, texture_size, detail, detail_strength)
     outdir = Path(output_dir).expanduser() if output_dir else src.parent
     outdir.mkdir(parents=True, exist_ok=True)
-    dst = outdir / output_name(src, f"_retopo_{method}_{int(target_faces)}.glb")
+    suffix = "lods_" + "_".join(map(str, lods)) if lods else str(int(target_faces))
+    dst = outdir / output_name(src, f"_retopo_{method}_{suffix}.glb")
     t0 = time.time()
     report = await blender_run.run(settings, "retopo.py",
-                                   script_args(src, dst, target_faces, method, texture_size, detail, detail_strength),
+                                   script_args(src, dst, target_faces, method, texture_size, detail, detail_strength,
+                                               lods),
                                    "RETOPO_RESULT", dst)
     if detail not in (None, "none") and method != "decimate":
         report["detail_note"] = ("detail weighting applies to method='decimate' only; quad remeshing uses one "
                                  "density everywhere")
+    if lods:
+        report["lod_note"] = ("One GLB and one FBX hold <name>_LOD0.. (Unity builds a LOD Group from the suffix). "
+                              "All LODs share LOD0's UVs and one material; LOD1 and lower are triangle "
+                              "decimations of LOD0 and their budgets count triangles.")
     report["path"] = str(dst)
     report["note"] = ("The GLB stores every quad as two triangles (glTF has no quads); the FBX keeps the "
                       "quads and embeds the textures.") if report.get("output_quads") else None

@@ -1,6 +1,11 @@
 """Retopologize a textured GLB in Blender and bake its materials onto the result.
 
-    blender -b --factory-startup -P retopo.py -- IN.glb OUT.glb FACES METHOD TEXTURE_SIZE [PYTHON]
+    blender -b --factory-startup -P retopo.py -- IN.glb OUT.glb FACES METHOD TEXTURE_SIZE [PYTHON
+        [DETAIL STRENGTH [LODS NAME]]]
+
+LODS is a comma separated list of face budgets (LOD0 first, equal to FACES);
+with it the output holds objects NAME_LOD0, NAME_LOD1, ... sharing LOD0's UVs
+and its one material.
 
 METHOD is "quad" or "decimate". quad gives an all quad mesh with even edge
 flow, which suits rigging, deformation and further modelling: Instant Meshes
@@ -38,6 +43,10 @@ tex_size = int(argv[4])
 remesh_python = argv[5] if len(argv) > 5 else ""  # a Python with localgen_mcp and pynanoinstantmeshes
 detail_source = argv[6] if len(argv) > 6 else "auto"  # auto | paint | none (decimate only)
 detail_strength = float(argv[7]) if len(argv) > 7 else 1.0
+# LOD chain: face budgets for LOD0, LOD1, ... (LOD0 is target_faces) and the base object name.
+lod_faces = [int(f) for f in argv[8].split(",") if f] if len(argv) > 8 else []
+lod_name = argv[9] if len(argv) > 9 else "mesh"
+high_weights = None  # the detail map on the original's vertices, when decimation used one
 report = {"input": src, "output": dst, "method_requested": method, "target_faces": target_faces}
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -143,30 +152,63 @@ def painted_detail(mesh):
     return np.clip(smooth_field(lum, edges, 1), 0.0, 1.0)
 
 
+def collapse(obj, ratio, weights):
+    """Apply a collapse decimation to obj (made active). Blender's collapse interpolates UVs and keeps
+    UV seams as seams, so a mesh that already has UVs keeps its layout."""
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    if ratio >= 1.0:
+        return obj
+    mod = obj.modifiers.new("dec", "DECIMATE")
+    mod.decimate_type = "COLLAPSE"
+    mod.ratio = ratio
+    mod.use_collapse_triangulate = True
+    if weights is not None:
+        # Blender collapses high-weight vertices first, so the group holds the detail map
+        # and is inverted: high detail is kept, low detail goes first.
+        group = obj.vertex_groups.new(name="detail")
+        for value in np.unique(np.round(weights, 2)):
+            idx = np.nonzero(np.round(weights, 2) == value)[0].tolist()
+            group.add(idx, float(value), "REPLACE")
+        mod.vertex_group = group.name
+        mod.invert_vertex_group = True
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+    if weights is not None:
+        obj.vertex_groups.remove(obj.vertex_groups["detail"])
+    return obj
+
+
 def decimate_once(ratio, weights):
-    low = fresh_low()
-    if ratio < 1.0:
-        mod = low.modifiers.new("dec", "DECIMATE")
-        mod.decimate_type = "COLLAPSE"
-        mod.ratio = ratio
-        mod.use_collapse_triangulate = True
-        if weights is not None:
-            # Blender collapses high-weight vertices first, so the group holds the detail map
-            # and is inverted: high detail is kept, low detail goes first.
-            group = low.vertex_groups.new(name="detail")
-            for value in np.unique(np.round(weights, 2)):
-                idx = np.nonzero(np.round(weights, 2) == value)[0].tolist()
-                group.add(idx, float(value), "REPLACE")
-            mod.vertex_group = group.name
-            mod.invert_vertex_group = True
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-    return low
+    return collapse(fresh_low(), ratio, weights)
+
+
+def triangles(obj):
+    return sum(len(p.vertices) - 2 for p in obj.data.polygons)
+
+
+def search_ratio(make, tris, faces, count=lambda o: len(o.data.polygons)):
+    """A weighted collapse does not land exactly on the ratio; search for the one that hits the budget.
+    make(ratio) returns a fresh decimated object (replacing the previous candidate)."""
+    ratio, best = faces / tris, None
+    for _ in range(5):
+        obj = make(ratio)
+        n = count(obj)
+        if best is None or abs(n - faces) < abs(best[1] - faces):
+            best = (ratio, n)
+        if abs(n - faces) <= 0.03 * faces:
+            break
+        ratio = min(1.0, ratio * faces / max(n, 1))
+    if count(obj) != best[1]:
+        obj = make(best[0])
+    return obj
 
 
 def decimate(faces):
+    global high_weights
     weld(high)  # once: every later copy starts welded
     weights = None
-    tris = sum(len(p.vertices) - 2 for p in high.data.polygons)
+    tris = triangles(high)
     if detail_source != "none" and tris > faces:
         detail = curvature_detail(high.data) if detail_source == "auto" else painted_detail(high.data)
         # Strength 0 is uniform. The contrast is capped (weights stay within 0.15..0.85): with
@@ -176,31 +218,26 @@ def decimate(faces):
                             "share_of_vertices_marked_detailed": round(float((detail > 0.5).mean()), 3)}
     if tris <= faces:
         return fresh_low()
-    # A weighted collapse does not land exactly on the ratio; search for the one that hits the budget.
-    ratio, best = faces / tris, None
-    for _ in range(5):
-        low = decimate_once(ratio, weights)
-        n = len(low.data.polygons)
-        if best is None or abs(n - faces) < abs(best[1] - faces):
-            best = (ratio, n)
-        if abs(n - faces) <= 0.03 * faces:
-            break
-        ratio = min(1.0, ratio * faces / max(n, 1))
-    if len(low.data.polygons) != best[1]:
-        low = decimate_once(best[0], weights)
+    high_weights = weights
+    low = search_ratio(lambda r: decimate_once(r, weights), tris, faces)
     if weights is not None:
         # How the faces ended up: share of the result inside the areas marked detailed.
         report["detail"]["share_of_faces_in_detailed_areas"] = detail_face_share(low, weights)
     return low
 
 
-def detail_face_share(low, weights):
-    """Fraction of the low poly faces lying in the high detail areas of the original (nearest vertex)."""
+def high_tree():
     from mathutils.kdtree import KDTree
     tree = KDTree(len(high.data.vertices))
     for v in high.data.vertices:
         tree.insert(v.co, v.index)
     tree.balance()
+    return tree
+
+
+def detail_face_share(low, weights):
+    """Fraction of the low poly faces lying in the high detail areas of the original (nearest vertex)."""
+    tree = high_tree()
     hits = sum(1 for p in low.data.polygons if weights[tree.find(p.center)[1]] > 0.5)
     return round(hits / max(len(low.data.polygons), 1), 3)
 
@@ -414,8 +451,85 @@ report["base_color_median"] = {"source": median_rgb(sources[0], False) if source
 for img in imgs.values():
     img.pack()
 
+
+def uv_texel_error(lod, base):
+    """How far each LOD triangle's UVs sit from the base mesh's UVs at the nearest point of its surface,
+    in texels. A shared layout gives a few texels; a broken seam or a different unwrap gives hundreds."""
+    from mathutils.bvhtree import BVHTree
+    from mathutils.geometry import barycentric_transform
+    base.data.calc_loop_triangles()
+    lod.data.calc_loop_triangles()
+    bco = [v.co.copy() for v in base.data.vertices]
+    btris = base.data.loop_triangles
+    tree = BVHTree.FromPolygons(bco, [t.vertices[:] for t in btris])
+    buv, luv = base.data.uv_layers.active.data, lod.data.uv_layers.active.data
+    lco = lod.data.vertices
+    errors = []
+    for t in lod.data.loop_triangles:
+        p = (lco[t.vertices[0]].co + lco[t.vertices[1]].co + lco[t.vertices[2]].co) / 3
+        uv = (luv[t.loops[0]].uv + luv[t.loops[1]].uv + luv[t.loops[2]].uv) / 3
+        loc, _normal, idx, _dist = tree.find_nearest(p)
+        bt = btris[idx]
+        at = barycentric_transform(loc, *(bco[i] for i in bt.vertices), *(buv[k].uv.to_3d() for k in bt.loops))
+        errors.append((at.xy - uv).length * tex_size)
+    errors = np.array(errors)
+    return {"median": round(float(np.median(errors)), 2), "p95": round(float(np.percentile(errors, 95)), 2),
+            "share_over_8_texels": round(float((errors > 8).mean()), 4)}
+
+
+def lod_candidate(name, weights):
+    """make(ratio) for search_ratio: a fresh decimated copy of LOD0 (UVs and material kept), replacing
+    the previous candidate."""
+    current = []
+
+    def make(ratio):
+        if current:
+            old = current.pop()
+            data = old.data
+            bpy.data.objects.remove(old, do_unlink=True)
+            bpy.data.meshes.remove(data)
+        obj = low.copy()
+        obj.data = low.data.copy()
+        obj.name = obj.data.name = name
+        scene.collection.objects.link(obj)
+        current.append(collapse(obj, ratio, weights))
+        return current[0]
+
+    return make
+
+
+# LOD chain: every further LOD is a collapse decimation of LOD0 that keeps LOD0's UVs and its one
+# material, so all LODs share the baked textures. Each one decimates LOD0 itself (not the LOD before),
+# so errors do not add up. When LOD0 came from a weighted decimation, the same detail map steers them.
+lod_objects = [low]
+if lod_faces:
+    low.name = low.data.name = f"{lod_name}_LOD0"
+    lod0_tris = triangles(low)
+    lod_weights = None
+    if high_weights is not None:
+        tree = high_tree()
+        lod_weights = np.array([high_weights[tree.find(v.co)[1]] for v in low.data.vertices])
+    report["lods"] = [{"name": low.name, "faces": len(low.data.polygons), "triangles": lod0_tris,
+                       "vertices": len(low.data.vertices)}]
+    for i, faces in enumerate(lod_faces[1:], 1):
+        make = lod_candidate(f"{lod_name}_LOD{i}", lod_weights)
+        entry = {"name": f"{lod_name}_LOD{i}", "target_faces": faces}
+        if faces >= lod0_tris:
+            obj = make(1.0)
+            entry["note"] = f"LOD0 has only {lod0_tris} triangles; copied without decimation"
+        else:
+            obj = search_ratio(make, lod0_tris, faces)
+        entry.update(faces=len(obj.data.polygons), triangles=triangles(obj), vertices=len(obj.data.vertices),
+                     uv_texel_error=uv_texel_error(obj, low))
+        if lod_weights is not None:
+            entry["share_of_faces_in_detailed_areas"] = detail_face_share(obj, high_weights)
+        report["lods"].append(entry)
+        lod_objects.append(obj)
+    report["materials"] = sorted({s.material.name for o in lod_objects for s in o.material_slots if s.material})
+
 bpy.ops.object.select_all(action="DESELECT")
-low.select_set(True)
+for obj in lod_objects:
+    obj.select_set(True)
 bpy.context.view_layer.objects.active = low
 bpy.ops.export_scene.gltf(filepath=dst, export_format="GLB", use_selection=True,
                           export_image_format="AUTO", export_apply=True)
