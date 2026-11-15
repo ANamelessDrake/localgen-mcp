@@ -19,13 +19,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 _MODULES = ["zimage_turbo", "flux2_klein_4b", "wan22_ti2v_5b", "trellis2", "pixal3d_multiview", "texture_mesh", "part_isolate",
-            "upscale", "remove_background", "turnaround"]
+            "upscale", "remove_background", "turnaround", "seamless_material"]
 
 
 @dataclass(frozen=True)
 class Workflow:
     name: str
-    modality: str                      # image | video | mesh | texture | part | upscale
+    modality: str                      # image | video | mesh | texture | part | upscale | material
     description: str
     models: list[str]                  # files under the ComfyUI models dir
     defaults: dict[str, Any]

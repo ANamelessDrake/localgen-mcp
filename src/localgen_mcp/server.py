@@ -26,7 +26,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, cutout, jobs, model_files, retopo, rig, speech, workflows
+from . import backend, blender_run, config, cutout, jobs, materials, model_files, retopo, rig, speech, workflows
 from .workflows.image_edit import edit_images
 from .workflows.part_isolate import part_prompt
 
@@ -465,6 +465,67 @@ async def generate_turnaround(
                                              output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds,
                                              ctx=ctx)
     return result
+
+
+@mcp.tool()
+async def generate_material(
+    prompt: str,
+    size: int = 1024,
+    reference_image: str | None = None,
+    tile_image: str | None = None,
+    name: str | None = None,
+    normal_strength: float = 1.0,
+    directx_normal: bool = False,
+    invert_height: bool = False,
+    roughness: float = 0.7,
+    roughness_variation: float = 0.25,
+    ao_strength: float = 0.6,
+    seam_passes: int = 2,
+    seam_denoise: float = 0.7,
+    seam_width: float = 0.25,
+    preview: str = "sphere",
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Make a tileable (seamless) PBR surface material for environment art: rock, rusted metal, floors.
+
+    prompt describes the surface only ("rough grey basalt rock with cracks"); "seamless top-down texture"
+    wording is added. size 1024 (default) or 2048 (512 to 2048, a multiple of 64). reference_image: a
+    picture whose colours and material to follow (FLUX.2 Klein). tile_image: make this existing image
+    tileable instead of generating one (the prompt still guides the seam repaint).
+    How it tiles: the image is offset by half its size with wrap around, then the cross where the old
+    edges meet is repainted image to image under a soft, ragged mask (Z-Image Turbo) and only the
+    masked part composited back; the arms stop short of the edges and the leftover spots are
+    repainted after a further quarter offset, so no repaint ever crosses an edge and the result
+    wraps exactly. seam_width (0.05 to 0.3 of the size, default 0.25) is how wide the band is;
+    seam_denoise (0.3 to 1.0, default 0.7) how freely it is repainted: higher hides a stubborn seam
+    but drifts from the surrounding texture. The wrap and the repainted centre are then measured;
+    while the centre still shows a line, the repaint runs again (seam_passes in all, default 2; a
+    rerun is kept only if it helps).
+    Maps, derived from the base color in Blender on the CPU, all tiling: height (16 bit; luminance,
+    high pass, light blur; brighter is higher, invert_height=True for the reverse), normal (tangent
+    space, OpenGL +Y green up as Unity and Blender expect; directx_normal=True writes DirectX -Y for
+    Unreal; normal_strength 0 to 10), roughness (roughness 0 to 1 is the base, 0.2 glossy, 0.8 matte;
+    rougher in cavities and dark spots by up to roughness_variation), ambient occlusion from the
+    height's cavities (ao_strength 0 to 1).
+    Previews: a 3x3 tiling of the base color, and a lit Cycles render (preview "sphere", "plane" or
+    "none") using every map. Look at both to judge seams and relief.
+    Output: <output_dir or /ai/output/localgen/material/<date>>/<name>_<seed>/ with <stem>_basecolor.png,
+    _height.png, _normal_gl.png (or _normal_dx.png), _roughness.png, _ao.png, _tile3x3.png,
+    _preview.png. Returns the paths, seed, the normal convention, and seam metrics per map ("tiles"
+    is true when every wrap edge is within the image's own neighbouring pixel differences).
+    About 25 s on the GPU at 1024 when warm (longer at 2048, and again for each extra seam pass),
+    plus 5 to 15 s in Blender on the CPU.
+    """
+    logger.info("generate_material: %r size=%d", prompt[:80], size)
+    return await materials.generate(
+        settings, prompt, size=size, reference_image=reference_image, tile_image=tile_image, name=name,
+        normal_strength=normal_strength, directx_normal=directx_normal, invert_height=invert_height,
+        roughness=roughness, roughness_variation=roughness_variation, ao_strength=ao_strength,
+        seam_passes=seam_passes, seam_denoise=seam_denoise, seam_width=seam_width, preview=preview, seed=seed,
+        output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx))
 
 
 @mcp.tool()
