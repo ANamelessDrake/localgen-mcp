@@ -211,19 +211,11 @@ def test_texture_view_names():
     assert view_name(350) == "front"
 
 
-def test_only_real_meshes_are_uploaded(tmp_path):
-    from localgen_mcp.jobs import is_mesh_file
+def test_only_glb_files_are_uploaded(tmp_path):
+    # texture_mesh re-serialises every input through Blender; run_workflow uploads only GLBs.
+    from localgen_mcp.jobs import is_glb
     glb = tmp_path / "a.glb"
     glb.write_bytes(b"glTF" + b"\0" * 16)
     obj = tmp_path / "b.obj"
-    obj.write_text("# made by hand\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
-    stl = tmp_path / "c.stl"
-    stl.write_bytes(b"\0" * 80 + (1).to_bytes(4, "little") + b"\0" * 50)
-    assert is_mesh_file(glb) and is_mesh_file(obj) and is_mesh_file(stl)
-    fake_glb = tmp_path / "secret.glb"
-    fake_glb.write_text("not a model")
-    fake_obj = tmp_path / "notes.obj"
-    fake_obj.write_text("password=hunter2\n")
-    fake_stl = tmp_path / "id_rsa.stl"
-    fake_stl.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----" + b"x" * 200)
-    assert not any(is_mesh_file(f) for f in (fake_glb, fake_obj, fake_stl))
+    obj.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+    assert is_glb(glb) and not is_glb(obj)

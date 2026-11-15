@@ -17,7 +17,9 @@ import asyncio
 import logging
 import os
 import signal
+import shutil
 import sys
+import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -51,6 +53,8 @@ def _timeout(name: str, default: int) -> int:
 
 
 TIMEOUTS = {"image": _timeout("image", 900), "video": _timeout("video", 5400), "mesh": _timeout("mesh", 3600)}
+
+MESH_INPUTS = (".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx")
 
 MESH_PROMPT_SUFFIX = (", a single object, centered, full view, isolated on a plain light grey background, "
                       "studio lighting, no shadows, product photo")
@@ -261,7 +265,7 @@ async def texture_mesh(
     idle_timeout_seconds: int | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Texture an existing mesh (GLB, glTF, OBJ or STL; untextured is fine) from a text prompt.
+    """Texture an existing mesh (GLB, glTF, OBJ, STL, PLY or FBX; untextured is fine) from a text prompt.
 
     Builds everything a PBR material needs: a fresh UV layout (keep_uvs=True keeps the mesh's own),
     a base color painted by FLUX.2 Klein on `views` clay renders around the mesh and projected into
@@ -277,13 +281,34 @@ async def texture_mesh(
         raise ValueError("denoise must be between 0.6 and 1.0")
     if not (0.0 <= bump <= 1.0 and 0.0 <= roughness <= 1.0 and 0.0 <= metallic <= 1.0):
         raise ValueError("bump, roughness and metallic must be between 0 and 1")
+    src = Path(input_mesh).expanduser().resolve()
+    if not src.is_file():
+        raise ValueError(f"input mesh not found: {src}")
+    if src.suffix.lower() not in MESH_INPUTS:
+        raise ValueError(f"input mesh must be one of {MESH_INPUTS}")
+    # Re-serialise through Blender and upload only that: ComfyUI's input folder can be served on
+    # the LAN by a hand-started instance, so the caller's own bytes are never copied there.
+    work = settings.root / "tmp" / f"texture-{uuid.uuid4().hex[:10]}"
+    work.mkdir(parents=True, exist_ok=True)
+    clean = work / "input.glb"
+    try:
+        await blender_run.run(settings, "convert_mesh.py", [src, clean], "CONVERT_RESULT", clean)
+        return await _texture(clean, src, prompt, style_image, views, texture_size, denoise, bump, roughness,
+                              metallic, keep_uvs, seed, output_dir, idle_timeout_seconds, ctx)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def _texture(clean, src, prompt, style_image, views, texture_size, denoise, bump, roughness, metallic,
+                   keep_uvs, seed, output_dir, idle_timeout_seconds, ctx) -> dict:
     wf = workflows.get("texture")
     overrides = {"prompt": prompt, "views": views, "texture_size": texture_size, "denoise": denoise,
                  "unwrap": not keep_uvs, "seed": seed}
     images = {"style": style_image} if style_image else None
-    logger.info("texture_mesh: %s (%s)", input_mesh, wf.name)
+    logger.info("texture_mesh: %s (%s)", src, wf.name)
     result = await jobs.run_workflow(settings, wf, [overrides], output_dir, idle_timeout_seconds, images=images,
-                                     timeout=TIMEOUTS["mesh"], progress=_progress(ctx), mesh=input_mesh)
+                                     timeout=TIMEOUTS["mesh"], progress=_progress(ctx), mesh=str(clean))
+    result["input_mesh"] = str(src)
     glb = next(Path(p) for p in result["paths"] if p.endswith(".glb"))
     final = glb.with_name(glb.stem + "_pbr.glb")
     maps = await blender_run.run(settings, "texture_maps.py", [glb, final, bump, roughness, metallic],

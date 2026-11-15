@@ -51,6 +51,8 @@ Quad remeshing uses [Instant Meshes](https://github.com/wjakob/instant-meshes) (
 4. **Projection:** `BakeTextureFromViews` projects the painted views into the UVs, each limited to its silhouette, and fills texels no view sees. `BakeAmbientOcclusion` adds AO.
 5. **Blender (CPU):** adds a tangent space normal map baked from a bump of the painted detail, a roughness map (rougher where the paint is darker) and metallic, then writes the GLB and an FBX.
 
+Inputs are GLB, glTF, OBJ, STL, PLY or FBX. Each is re-exported through Blender, and only that fresh GLB is uploaded: like images, which must be real image files, a caller's file is never copied into ComfyUI's input folder as is. Uploads are deleted when the job finishes.
+
 Limits: every view is painted separately, so the views can disagree on details. Parts seen only edge-on, or only from above, get filled or blended colour. It works best on clean meshes of a few thousand to 50k faces, such as `retopologize_mesh` output.
 
 ### Idle timeout

@@ -50,33 +50,9 @@ def is_image_file(path: Path) -> bool:
     return any(head.startswith(m) for m in _IMAGE_MAGIC)
 
 
-MESH_SUFFIXES = (".glb", ".gltf", ".obj", ".stl")
-
-
-def is_mesh_file(path: Path) -> bool:
-    """A 3D model Get3DComponents reads, checked by content so arbitrary files are never uploaded:
-    binary glTF by signature, glTF as JSON with an "asset" entry, binary STL by its exact size,
-    ASCII STL and OBJ by their keywords."""
-    suffix = path.suffix.lower()
+def is_glb(path: Path) -> bool:
     with open(path, "rb") as f:
-        head = f.read(65536)
-    if suffix == ".glb":
-        return head[:4] == b"glTF"
-    if suffix == ".gltf":
-        return head.lstrip().startswith(b"{") and b'"asset"' in head
-    if suffix == ".stl":
-        if head[:5] == b"solid" and b"facet" in head:
-            return True
-        if len(head) >= 84:
-            count = int.from_bytes(head[80:84], "little")
-            return path.stat().st_size == 84 + 50 * count
-        return False
-    if suffix == ".obj":
-        keys = {"v", "vn", "vt", "f", "o", "g", "s", "mtllib", "usemtl", "#"}
-        lines = [ln.split(maxsplit=1) for ln in head.decode("utf-8", errors="replace").splitlines() if ln.strip()]
-        return bool(lines) and all(ln[0] in keys or ln[0].startswith("#") for ln in lines[:-1]) \
-            and any(ln[0] == "v" for ln in lines)
-    return False
+        return f.read(4) == b"glTF"
 
 
 def placeholder_png(path: Path) -> Path:
@@ -154,8 +130,10 @@ async def run_workflow(
         mesh_path = Path(mesh).expanduser().resolve()
         if not mesh_path.is_file():
             raise JobError(f"input mesh not found: {mesh_path}")
-        if mesh_path.suffix.lower() not in MESH_SUFFIXES or not is_mesh_file(mesh_path):
-            raise JobError(f"not a GLB, glTF, OBJ or STL model: {mesh_path} (convert FBX to GLB first)")
+        # Only GLB files this server wrote (texture_mesh re-serialises every input through
+        # Blender first) are uploaded; a caller's file is never copied into ComfyUI's input folder.
+        if mesh_path.suffix.lower() != ".glb" or not is_glb(mesh_path):
+            raise JobError(f"not a GLB: {mesh_path}")
 
     params_list = []
     base_seed = None
@@ -176,16 +154,20 @@ async def run_workflow(
     info = await asyncio.to_thread(backend.ensure_backend, settings, idle_timeout_seconds)
     client = ComfyClient(settings.base_url)
 
+    uploads: list[str] = []  # names in ComfyUI's input folder, removed when the job is done
+
     async def submit_all() -> list[str]:
         if image_paths:
             uploaded = {slot: await asyncio.to_thread(client.upload_image, path)
                         for slot, path in image_paths.items()}
+            uploads.extend(uploaded.values())
             for p in params_list:
                 p["images"] = uploaded
         if mesh_path is not None:
             name = await asyncio.to_thread(client.upload_image, mesh_path, "3d/localgen")
             placeholder = await asyncio.to_thread(
                 client.upload_image, placeholder_png(settings.root / "tmp" / "localgen_placeholder.png"))
+            uploads.append(name)
             for p in params_list:
                 p["mesh"], p["placeholder"] = name, placeholder
         backend.touch_activity(settings)
@@ -254,6 +236,8 @@ async def run_workflow(
         await asyncio.sleep(1)
 
     backend.touch_activity(settings)
+    if info.managed:
+        _remove_inputs(settings, uploads)
     effective = backend.read_int(settings.timeout_file) if info.managed else None
     return {
         "workflow": workflow.name,
@@ -269,6 +253,19 @@ async def run_workflow(
         **info.as_dict(),
         "idle_timeout_seconds": effective if info.managed else None,
     }
+
+
+def _remove_inputs(settings: Settings, names: list[str]) -> None:
+    """Delete this job's uploads from ComfyUI's input folder, so inputs do not pile up where a
+    hand-started, LAN-bound instance would serve them."""
+    in_root = (settings.comfy_dir / "input").resolve()
+    for name in names:
+        p = (in_root / name).resolve()
+        if in_root in p.parents and p.is_file():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def _remove_comfy_copies(settings: Settings, files: list[dict]) -> None:

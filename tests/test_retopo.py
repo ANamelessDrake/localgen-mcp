@@ -78,3 +78,19 @@ def test_real_retopology_keeps_colour_and_hits_the_budget(settings, tmp_path, me
     assert report["base_color_median"]["source"] == [200, 60, 30]
     baked = report["base_color_median"]["baked"]
     assert all(abs(b - s) <= 6 for b, s in zip(baked, (200, 60, 30))), baked
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender is not installed")
+def test_texture_input_is_reserialised_without_foreign_bytes(settings, tmp_path):
+    """texture_mesh uploads Blender's re-export, never the caller's file: data hidden in an input
+    (here past the first 64 KB of a valid OBJ) must not reach the GLB that gets uploaded."""
+    from localgen_mcp import blender_run
+    secret = "AKIA-NOT-A-REAL-KEY-0123456789"
+    verts = "".join(f"v {i % 7} {i % 5} {i % 3}\n" for i in range(6000))  # well over 64 KB
+    src = tmp_path / "model.obj"
+    src.write_text(verts + "f 1 2 3\nf 4 5 6\n# " + secret + "\n")
+    dst = tmp_path / "clean.glb"
+    report = asyncio.run(blender_run.run(settings, "convert_mesh.py", [src, dst], "CONVERT_RESULT", dst))
+    assert report["faces"] == 2
+    data = dst.read_bytes()
+    assert data[:4] == b"glTF" and secret.encode() not in data
