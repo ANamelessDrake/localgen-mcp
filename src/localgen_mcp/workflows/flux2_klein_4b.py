@@ -6,11 +6,16 @@ each reference image scaled to about 1 megapixel, VAE encoded and attached to
 both the positive and the zeroed negative conditioning with ReferenceLatent,
 Flux2Scheduler 4 steps, euler, CFGGuider cfg 1. The output takes the first
 reference image's size unless width and height are given.
+
+With an input image (slot "image", optionally "mask") it edits that image: it
+is reference image 1 and also the start latent (SplitSigmasDenoise runs the
+last `denoise` part of the schedule), any other references follow it, and the
+output keeps the input's size (see image_edit.py for the mask and composite).
 """
 
 from __future__ import annotations
 
-from . import Workflow
+from . import Workflow, image_edit
 
 SLOTS = ("ref1", "ref2", "ref3", "ref4")
 MODELS = ("diffusion_models/flux-2-klein-4b-fp8.safetensors", "text_encoders/qwen_3_4b.safetensors",
@@ -26,13 +31,15 @@ def add_loaders(g: dict) -> None:
 
 
 def add_edit(g: dict, ns: str, text: str, refs: list[list], seed: int, steps: int, width, height,
-             init: list | None = None, denoise: float = 1.0, upscale: str = "nearest-exact") -> list:
+             init: list | None = None, denoise: float = 1.0, upscale: str = "nearest-exact",
+             mask: list | None = None) -> list:
     """Add one Klein sampling chain to g (loaders from add_loaders) and return its decoded IMAGE link.
 
     refs are IMAGE links, each scaled to about 1 megapixel, VAE encoded and attached to both the
     positive and the zeroed negative conditioning with ReferenceLatent. With init (an IMAGE link),
     sampling starts from that image's latent and runs only the last `denoise` part of the
-    schedule (image to image), which keeps its composition.
+    schedule (image to image), which keeps its composition; mask (a MASK link) then limits the
+    noise to that region with SetLatentNoiseMask.
     """
     unet, clip, vae = LOADERS
     g[ns + "text"] = {"class_type": "CLIPTextEncode", "inputs": {"text": text, "clip": [clip, 0]}}
@@ -52,6 +59,9 @@ def add_edit(g: dict, ns: str, text: str, refs: list[list], seed: int, steps: in
         g[ns + "init"] = {"class_type": "VAEEncode", "inputs": {"pixels": init, "vae": [vae, 0]}}
         g[ns + "split"] = {"class_type": "SplitSigmasDenoise", "inputs": {"sigmas": sigmas, "denoise": denoise}}
         sigmas, latent = [ns + "split", 1], [ns + "init", 0]
+        if mask is not None:
+            g[ns + "noise_mask"] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": latent, "mask": mask}}
+            latent = [ns + "noise_mask", 0]
     else:
         g[ns + "empty"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
         latent = [ns + "empty", 0]
@@ -74,6 +84,16 @@ def build(p: dict) -> dict:
     for i, name in enumerate(r for r in (p.get("images", {}).get(s) for s in SLOTS) if r):
         g[f"load{i}"] = {"class_type": "LoadImage", "inputs": {"image": name}}
         refs.append([f"load{i}", 0])
+    src = image_edit.add_source(g, p)
+    if src:
+        # The edited image is image 1 and the start latent; the output keeps its size.
+        g["size"] = {"class_type": "GetImageSize", "inputs": {"image": src["work"]}}
+        steps, denoise = image_edit.schedule_steps(int(p["steps"]), float(p["denoise"]))
+        image = add_edit(g, "", p["prompt"], [src["work"]] + refs, p["seed"], steps, ["size", 0], ["size", 1],
+                         init=src["work"], denoise=denoise, mask=src["mask"])
+        g["save"] = {"class_type": "SaveImage", "inputs": {"images": image_edit.finish(g, image, src),
+                                                           "filename_prefix": p["prefix"]}}
+        return g
     if p.get("width") and p.get("height"):
         width, height = int(p["width"]), int(p["height"])
     elif refs:
@@ -95,8 +115,8 @@ WORKFLOW = Workflow(
     description=("FLUX.2 Klein 4B fp8 (Apache 2.0): text to image, or edit and combine up to 4 reference "
                  "images guided by the prompt (for example 'put the person from image 1 in the room from image 2')"),
     models=list(MODELS),
-    defaults={"width": None, "height": None, "steps": 4},
+    defaults={"width": None, "height": None, "steps": 4, "denoise": 1.0},
     limits={"width": (256, 2048), "height": (256, 2048), "steps": (1, 50)},
     build=build,
-    image_slots=SLOTS,
+    image_slots=SLOTS + image_edit.EDIT_SLOTS,
 )
