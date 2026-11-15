@@ -55,6 +55,27 @@ def is_glb(path: Path) -> bool:
         return f.read(4) == b"glTF"
 
 
+def image_size(path: Path) -> tuple[int, int]:
+    """Width and height of a PNG or JPEG, read from its header (the MCP venv has no imaging library)."""
+    import struct
+    with open(path, "rb") as f:
+        data = f.read(1 << 20)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", data[16:24])
+    if data[:3] == b"\xff\xd8\xff":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker, length = data[i + 1], struct.unpack(">H", data[i + 2:i + 4])[0]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            i += 2 + length
+    raise JobError(f"cannot read the size of {path}; use a PNG or JPEG")
+
+
 def placeholder_png(path: Path) -> Path:
     """An 8x8 black PNG, written once (Load3D wants viewport images even when run headless)."""
     if not path.exists():

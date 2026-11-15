@@ -143,3 +143,26 @@ def test_painted_detail_puts_the_faces_where_painted(settings, tmp_path):
     # Half the surface is painted white; uniform decimation would put about half the faces there.
     assert d["share_of_faces_in_detailed_areas"] > 0.65, d
     assert abs(painted["output_faces"] - 1500) <= 0.05 * 1500
+
+
+@pytest.mark.skipif(BLENDER is None, reason="Blender is not installed")
+def test_parts_are_placed_by_their_boxes_and_rigged_at_the_joint(settings, tmp_path):
+    from localgen_mcp import blender_run
+    subprocess.run([BLENDER, "-b", "--factory-startup", "-P", str(HERE / "blender_make_parts.py"), "--", str(tmp_path)],
+                   check=True, capture_output=True, timeout=300)
+    spec = {"concept": str(tmp_path / "concept.png"), "full_mesh": str(tmp_path / "full.glb"), "rig": True,
+            "out_glb": str(tmp_path / "out.glb"), "out_fbx": str(tmp_path / "out.fbx"),
+            "parts": [{"name": "body", "mesh": str(tmp_path / "body.glb"), "box": [100, 50, 300, 450]},
+                      {"name": "arm", "mesh": str(tmp_path / "arm.glb"), "box": [300, 90, 380, 290]}]}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    rep = asyncio.run(blender_run.run(settings, "assemble_parts.py", [tmp_path / "spec.json"], "ASSEMBLE_RESULT",
+                                      tmp_path / "out.glb"))
+    assert rep["root"] == "body" and rep["parts"]["arm"]["parent"] == "body" and not rep["warnings"]
+    (ax0, ay0, az0), (ax1, ay1, az1) = rep["parts"]["arm"]["bbox"]
+    # placed where the box says, within a pixel or two of the 400 px per unit drawing
+    for got, want in ((ax0, 0.25), (ax1, 0.45), (az0, 0.4), (az1, 0.9)):
+        assert abs(got - want) < 0.015, rep["parts"]["arm"]
+    assert abs((ay0 + ay1) / 2) < 0.03  # depth from the full mesh
+    px, _, pz = rep["parts"]["arm"]["pivot"]
+    assert abs(px - 0.25) < 0.03 and 0.4 < pz < 0.9  # the joint is the shoulder face
+    assert (tmp_path / "out.fbx").stat().st_size > 10000

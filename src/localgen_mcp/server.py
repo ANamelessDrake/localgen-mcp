@@ -14,8 +14,10 @@ follows the kicad-mcp server by the same author.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import signal
 import shutil
 import sys
@@ -25,6 +27,7 @@ from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
 
 from . import backend, blender_run, config, jobs, model_files, retopo, workflows
+from .workflows.part_isolate import part_prompt
 
 
 def _configure_logging() -> logging.Logger:
@@ -255,6 +258,155 @@ async def retopologize_mesh(
     """
     return await retopo.retopologize(settings, input_mesh, target_faces, method, texture_size, output_dir,
                                      detail, detail_strength)
+
+
+def _part_boxes(parts: list[dict], width: int, height: int) -> list[dict]:
+    """Validate the part list; boxes given as fractions (0..1) become pixels."""
+    if not parts:
+        raise ValueError("give at least one part")
+    seen, out = set(), []
+    for i, p in enumerate(parts):
+        if not isinstance(p, dict) or "box" not in p:
+            raise ValueError(f"part {i} needs a box [x0, y0, x1, y1]")
+        name = re.sub(r"[^A-Za-z0-9_]+", "_", str(p.get("name") or f"part{i}")).strip("_") or f"part{i}"
+        if name in seen:
+            raise ValueError(f"duplicate part name {name!r}")
+        seen.add(name)
+        box = [float(c) for c in p["box"]]
+        if len(box) != 4:
+            raise ValueError(f"{name}: box must be [x0, y0, x1, y1]")
+        if max(box) <= 1.0:
+            box = [box[0] * width, box[1] * height, box[2] * width, box[3] * height]
+        x0, y0, x1, y1 = (int(round(c)) for c in box)
+        x0, x1 = sorted((max(0, min(width, x0)), max(0, min(width, x1))))
+        y0, y1 = sorted((max(0, min(height, y0)), max(0, min(height, y1))))
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            raise ValueError(f"{name}: box is too small")
+        out.append({"name": name, "box": [x0, y0, x1, y1], "parent": p.get("parent"),
+                    "description": str(p.get("description") or "")})
+    return out
+
+
+@mcp.tool()
+async def generate_parts(
+    concept_image: str,
+    parts: list[dict],
+    subject: str = "character",
+    full_mesh: str | None = None,
+    face_count: int = 20000,
+    rig: bool = True,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Build a model as separate part meshes from a front view concept, assembled and rigidly rigged.
+
+    parts: one entry per part, {"name": "left_arm", "box": [x0, y0, x1, y1], "parent": optional part
+    name, "description": optional words to tell it apart}. The box is where that part is in
+    concept_image, as fractions of the image (0 to 1) or pixels; look at the image and give a rough
+    box around each part (overlaps are fine). subject names the object ("robot", "stingray").
+    Each part is cropped, cleaned into a standalone part by FLUX.2 Klein (hidden areas completed) and
+    meshed by TRELLIS.2 with face_count faces. The parts are placed by their boxes, with depth from a
+    whole-object mesh (generated from the concept unless full_mesh, a GLB of it, is given).
+    rig=True adds an armature with one bone per part: the hierarchy follows the parents given, else
+    which parts touch (rooted at the largest part), and each bone pivots where its part meets its
+    parent. Parts are parented rigidly to their bones, the natural rig for robots and other hard
+    surface models. If a run fails part way, call again with the same output_dir: finished parts are
+    reused. Output: an assembled GLB and FBX (each part a separate object), plus every part's
+    image and mesh. About 1 to 2 minutes per part on the GPU.
+    """
+    concept = Path(concept_image).expanduser().resolve()
+    if not concept.is_file() or not jobs.is_image_file(concept):
+        raise ValueError(f"concept_image must be a PNG or JPEG: {concept}")
+    width, height = jobs.image_size(concept)
+    specs = _part_boxes(parts, width, height)
+    if full_mesh:
+        fm = Path(full_mesh).expanduser().resolve()
+        if fm.suffix.lower() != ".glb" or not retopo.is_glb(fm):
+            raise ValueError(f"full_mesh must be a GLB: {fm}")
+        model_files.require_self_contained(fm)
+    outdir = (Path(output_dir).expanduser() if output_dir
+              else jobs.default_output_dir(settings, "parts") / uuid.uuid4().hex[:10])
+    outdir.mkdir(parents=True, exist_ok=True)
+    progress = _progress(ctx)
+    # Resume: a rerun into the same output_dir reuses every part image and mesh made with the same
+    # settings, so one failure (say, the GPU running out of memory) does not cost the finished parts.
+    state_path = outdir / "parts_state.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+
+    def key(sp: dict, i: int) -> str:
+        return json.dumps([sp["name"], sp["box"], sp["description"], subject, str(concept),
+                           concept.stat().st_mtime, None if seed is None else seed + i, face_count])
+
+    def save_state() -> None:
+        state_path.write_text(json.dumps(state, indent=1))
+
+    for i, sp in enumerate(specs):
+        old = state.get(sp["name"], {})
+        if old.get("key") == key(sp, i):
+            sp.update({k: old[k] for k in ("image", "mesh") if old.get(k) and Path(old[k]).is_file()})
+
+    # 1. Isolate the parts not done yet in one batch, so Klein loads once.
+    iso = workflows.get("part")
+    overrides, todo = [], []
+    for i, sp in enumerate(specs):
+        if sp.get("image"):
+            continue
+        todo.append((i, sp))
+        x0, y0, x1, y1 = sp["box"]
+        pad_x, pad_y = int(0.04 * (x1 - x0)), int(0.04 * (y1 - y0))
+        cx0, cy0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+        cx1, cy1 = min(width, x1 + pad_x), min(height, y1 + pad_y)
+        overrides.append({"x": cx0, "y": cy0, "w": cx1 - cx0, "h": cy1 - cy0, "seed": None if seed is None else seed + i,
+                          "prompt": part_prompt(sp["name"].replace("_", " "), subject, sp["description"])})
+    if overrides:
+        isolated = await jobs.run_workflow(settings, iso, overrides, str(outdir), idle_timeout_seconds,
+                                           images={"concept": str(concept)}, timeout=TIMEOUTS["image"],
+                                           progress=progress)
+        for (i, sp), out in zip(todo, isolated["outputs"]):
+            sp["image"] = out["paths"][0]
+            state[sp["name"]] = {"key": key(sp, i), "image": sp["image"]}
+        save_state()
+
+    # 2. Mesh the whole object (placement reference) and each part.
+    mesh_wf = workflows.get("mesh", "trellis2")
+    if not full_mesh and Path(state.get("_reference", {}).get("mesh", "/nonexistent")).is_file() \
+            and state["_reference"].get("key") == json.dumps([str(concept), concept.stat().st_mtime, seed]):
+        full_mesh = state["_reference"]["mesh"]
+    if not full_mesh:
+        whole = await jobs.run_workflow(settings, mesh_wf, [{"seed": seed}], str(outdir / "reference"),
+                                        idle_timeout_seconds, images={"image": str(concept)},
+                                        timeout=TIMEOUTS["mesh"], progress=progress)
+        full_mesh = whole["paths"][0]
+        state["_reference"] = {"key": json.dumps([str(concept), concept.stat().st_mtime, seed]), "mesh": full_mesh}
+        save_state()
+    for i, sp in enumerate(specs):
+        if sp.get("mesh"):
+            continue
+        res = await jobs.run_workflow(settings, mesh_wf, [{"seed": seed, "face_count": face_count}],
+                                      str(outdir / "parts"), idle_timeout_seconds, images={"image": sp["image"]},
+                                      timeout=TIMEOUTS["mesh"], progress=progress)
+        sp["mesh"] = res["paths"][0]
+        state[sp["name"]]["mesh"] = sp["mesh"]
+        save_state()
+
+    # 3. Assemble and rig in Blender.
+    out_glb = outdir / "assembled.glb"
+    spec = {"concept": str(concept), "full_mesh": str(full_mesh), "rig": rig,
+            "out_glb": str(out_glb), "out_fbx": str(outdir / "assembled.fbx"),
+            "parts": [{"name": s["name"], "mesh": s["mesh"], "box": s["box"], "parent": s["parent"]} for s in specs]}
+    spec_path = outdir / "assembly.json"
+    spec_path.write_text(json.dumps(spec, indent=2))
+    report = await blender_run.run(settings, "assemble_parts.py", [spec_path], "ASSEMBLE_RESULT", out_glb)
+    return {"assembled": str(out_glb), "fbx": report["fbx"], "output_dir": str(outdir), "full_mesh": str(full_mesh),
+            "parts": [{**{k: s[k] for k in ("name", "box", "image", "mesh")}, **report["parts"].get(s["name"], {})}
+                      for s in specs],
+            "root": report.get("root"), "warnings": report.get("warnings", []),
+            "paths": [str(out_glb), report["fbx"]] + [s["mesh"] for s in specs]}
 
 
 @mcp.tool()

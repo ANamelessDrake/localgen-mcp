@@ -219,3 +219,28 @@ def test_only_glb_files_are_uploaded(tmp_path):
     obj = tmp_path / "b.obj"
     obj.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
     assert is_glb(glb) and not is_glb(obj)
+
+
+def test_part_boxes_accept_fractions_or_pixels():
+    from localgen_mcp.server import _part_boxes
+    out = _part_boxes([{"name": "left arm!", "box": [0.5, 0.25, 0.75, 0.5]},
+                       {"name": "leg", "box": [10, 20, 2000, 300], "parent": "left_arm"}], 1000, 800)
+    assert out[0]["name"] == "left_arm" and out[0]["box"] == [500, 200, 750, 400]
+    assert out[1]["box"] == [10, 20, 1000, 300] and out[1]["parent"] == "left_arm"  # clamped to the image
+    with pytest.raises(ValueError):
+        _part_boxes([{"name": "a", "box": [0, 0, 0.5, 0.5]}, {"name": "a", "box": [0, 0, 0.5, 0.5]}], 100, 100)
+    with pytest.raises(ValueError):
+        _part_boxes([{"name": "tiny", "box": [10, 10, 12, 12]}], 100, 100)
+    with pytest.raises(ValueError):
+        _part_boxes([], 100, 100)
+
+
+def test_part_isolation_crops_then_cleans():
+    wf = workflows.get("part")
+    g = wf.build(_params(wf, prompt="x", images={"concept": "c.png"}, x=10, y=20, w=300, h=400))
+    _check_graph(g)
+    assert g["crop"]["inputs"] | {} == {"image": ["concept", 0], "x": 10, "y": 20, "width": 300, "height": 400}
+    # Klein's only reference is the crop, which pins the part's identity and pose
+    refs = [n for n in g.values() if n["class_type"] == "ReferenceLatent"]
+    scales = {g[r["inputs"]["latent"][0]]["inputs"]["pixels"][0] for r in refs}
+    assert {g[s]["inputs"]["image"][0] for s in scales} == {"crop"}

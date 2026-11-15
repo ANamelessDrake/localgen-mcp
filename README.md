@@ -16,6 +16,7 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `generate_mesh` | Textured GLB from `input_image` (TRELLIS.2), or from `prompt` alone (an image is generated first). With `left_image`, `back_image` and/or `right_image`, builds from several views (Pixal3D multi-view); `framing` picks how the views are read (below). |
 | `retopologize_mesh` | Game weight copy of any textured GLB: quad remesh (Instant Meshes) or decimation to `target_faces`, new UVs, and base color, roughness, metallic and normal maps baked from the original. Writes a GLB and an FBX (the FBX keeps real quads). Headless Blender on the CPU, about 10 to 30 s. `generate_mesh` runs it too when given `retopo_faces`. |
 | `texture_mesh` | Texture an existing mesh (GLB, glTF, OBJ or STL) from a prompt and optional `style_image`: fresh UVs, a painted base color projected from several views, AO, a bump-derived normal map, roughness and metallic. Writes a GLB, an FBX and the painted views. About 35 s on the GPU plus a few seconds in Blender. |
+| `generate_parts` | Build a model as separate part meshes from a front view concept and a box for each part, assembled in place and rigidly rigged (one bone per part, pivoting at the joints). Writes a GLB and an FBX. About 1 to 2 minutes per part. |
 | `status` | Whether the backend is running and managed, the effective idle timeout, queue length, GPU memory, and which models are installed. |
 | `start_backend` | Warm the backend ahead of a batch, optionally with a longer `idle_timeout_seconds`. |
 | `stop_backend` | Stop it now to free memory. Refuses while jobs are queued unless `force=true`. |
@@ -60,6 +61,16 @@ Quad remeshing uses [Instant Meshes](https://github.com/wjakob/instant-meshes) (
 Inputs are GLB, glTF, OBJ, STL, PLY or FBX. Each is re-exported through Blender, and only that fresh GLB is uploaded: like images, which must be real image files, a caller's file is never copied into ComfyUI's input folder as is. Uploads are deleted when the job finishes.
 
 Limits: every view is painted separately, so the views can disagree on details. Parts seen only edge-on, or only from above, get filled or blended colour. It works best on clean meshes of a few thousand to 50k faces, such as `retopologize_mesh` output.
+
+### Separate parts and a rigid rig
+
+`generate_parts` is for models that animate as hinged parts (robots, machines, armoured creatures).
+- **Input:** a front view concept image and, for each part, a name and a rough box (fractions of the image or pixels). The calling agent can read the boxes off the image. An optional parent and a few words of description can be given.
+- **Isolation:** each box is cropped, and FLUX.2 Klein redraws just that part as a complete standalone piece, with hidden areas filled in. Asking Klein to isolate or recolour a part of the whole image was unreliable (it moved, merged or missed parts), so the crop matters.
+- **Meshing:** TRELLIS.2 meshes each part (`face_count`, default 20k).
+- **Placement:** each part is placed by its box: scaled to fit it, with depth taken from a whole-object mesh made from the same concept, which is also given back as `full_mesh`.
+- **Rig:** one bone per part. The hierarchy follows the given parents, else which parts touch (a minimum spanning tree rooted at the largest part). Each bone pivots where its part meets its parent, and each part mesh is parented rigidly to its bone. The output is a GLB and an FBX with every part as its own object.
+- **Resume:** a failed run (for example the GPU running out of memory while another application holds VRAM) resumes when called again with the same `output_dir`, reusing finished parts.
 
 ### Idle timeout
 
