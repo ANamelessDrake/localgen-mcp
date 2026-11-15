@@ -1,5 +1,5 @@
-"""generate_material: the seamless graph's wiring (its roll is executed in numpy with ComfyUI's
-node semantics), the seam metric, wrap-around map maths, the PNG writer, and (when Blender
+"""generate_material: the seamless graph (executed in numpy with ComfyUI's node semantics and
+a stand-in for the model), the seam metric, wrap-around map maths, the PNG writer, and (when Blender
 is installed) a real run of the map script."""
 
 from __future__ import annotations
@@ -38,63 +38,6 @@ def _rough_image(n=256, seed=0):
     return np.clip(np.stack([base, base * 0.8, base * 0.6], -1), 0, 1)
 
 
-def _run(g: dict, link: list, inputs: dict) -> np.ndarray:
-    """Evaluate the IMAGE graph behind link with numpy, as ComfyUI's ImageCrop and
-    ImageCompositeMasked (no mask) do. inputs maps node ids to arrays."""
-    nid, _ = link
-    if nid in inputs:
-        return inputs[nid]
-    node = g[nid]
-    a = node["inputs"]
-    if node["class_type"] == "ImageCrop":
-        img = _run(g, a["image"], inputs)
-        return img[a["y"]:a["y"] + a["height"], a["x"]:a["x"] + a["width"]]
-    if node["class_type"] == "ImageCompositeMasked":
-        assert "mask" not in a
-        dest = _run(g, a["destination"], inputs).copy()
-        src = _run(g, a["source"], inputs)
-        h = min(src.shape[0], dest.shape[0] - a["y"])
-        w = min(src.shape[1], dest.shape[1] - a["x"])
-        dest[a["y"]:a["y"] + h, a["x"]:a["x"] + w] = src[:h, :w]
-        return dest
-    raise AssertionError(f"unexpected node {node['class_type']}")
-
-
-# -- graph wiring ---------------------------------------------------------
-
-
-def test_roll_is_a_half_offset_with_wrap_around():
-    n = 256
-    img = _rough_image(n)
-    g: dict = {}
-    out = sm.add_roll(g, "r_", ["src", 0], n)
-    rolled = _run(g, out, {"src": img})
-    assert np.array_equal(rolled, np.roll(img, (n // 2, n // 2), axis=(0, 1)))
-    # The input does not wrap; the rolled image does, and its old edges meet in the centre.
-    before, after = pbr_maps.seam_metrics(img), pbr_maps.seam_metrics(rolled)
-    assert not before["ok"]
-    assert after["ok"] and not after["centre_ok"]
-
-
-def test_text_graph_rolls_then_repaints_only_the_seam_band():
-    p = _params()
-    g = workflows.get("material").build(p)
-    assert g["z_text"]["inputs"]["text"].startswith("grey rock, seamless tileable texture")
-    assert g["base_sample"]["inputs"]["denoise"] == 1 and g["base_latent"]["inputs"]["width"] == 1024
-    # base -> roll -> encode -> noise mask -> sampler (partial denoise) -> decode -> masked composite -> save
-    assert g["roll_crop0"]["inputs"]["image"] == ["base_dec", 0]
-    assert g["pass_enc"]["inputs"]["pixels"] == ["roll_paste3", 0]
-    assert g["pass_noise_mask"]["inputs"] == {"samples": ["pass_enc", 0], "mask": ["seam_mask", 0]}
-    assert g["pass_sample"]["inputs"]["latent_image"] == ["pass_noise_mask", 0]
-    assert g["pass_sample"]["inputs"]["denoise"] == 0.7
-    assert g["pass_sample"]["inputs"]["seed"] == 8
-    comp = g["pass_out"]["inputs"]
-    assert comp["destination"] == ["roll_paste3", 0] and comp["source"] == ["pass_dec", 0]
-    assert comp["mask"] == ["seam_mask", 0]
-    assert g["save"]["inputs"]["images"] == ["pass_out", 0]
-    assert g["save_untiled"]["inputs"]["images"] == ["base_dec", 0]
-
-
 def _upscale_bilinear(a: np.ndarray, size: int) -> np.ndarray:
     """Bilinear resize as torch's interpolate (align_corners=False) does."""
     n = a.shape[0]
@@ -103,54 +46,139 @@ def _upscale_bilinear(a: np.ndarray, size: int) -> np.ndarray:
     return np.array([np.interp(src, np.arange(n), c) for c in rows.T]).T
 
 
-def _mask(g: dict, link: list, rng) -> np.ndarray:
-    """Evaluate the seam mask graph with numpy, following ComfyUI's mask node semantics."""
-    node = g[link[0]]
-    a, kind = node["inputs"], node["class_type"]
-    if kind == "SolidMask":
-        return np.full((a["height"], a["width"]), a["value"])
-    if kind == "MaskComposite":
-        out = _mask(g, a["destination"], rng).copy()
-        src = _mask(g, a["source"], rng)
-        x, y = a["x"], a["y"]
-        h, w = min(src.shape[0], out.shape[0] - y), min(src.shape[1], out.shape[1] - x)
-        region = out[y:y + h, x:x + w]
-        out[y:y + h, x:x + w] = region * src[:h, :w] if a["operation"] == "multiply" else region + src[:h, :w]
-        return np.clip(out, 0, 1)
-    if kind in ("MaskToImage", "ImageToMask"):
-        return _mask(g, a["mask" if kind == "MaskToImage" else "image"], rng)
-    if kind == "ImageAddNoise":
-        img = _mask(g, a["image"], rng)
-        return np.clip(img + a["strength"] * rng.standard_normal(img.shape), 0, 1)
-    if kind == "ImageScale":
-        assert a["upscale_method"] == "bilinear"
-        return _upscale_bilinear(_mask(g, a["image"], rng), a["width"])
-    raise AssertionError(f"unexpected node {kind}")
+class _Comfy:
+    """Evaluates a graph with numpy, following the semantics of ComfyUI's ImageCrop,
+    ImageCompositeMasked, mask and noise nodes. Images are (H, W, C), masks (H, W). The model is
+    replaced: every VAEDecode returns `painted`, a stand-in for whatever the sampler draws, so the
+    test sees exactly which pixels a repaint can reach."""
+
+    def __init__(self, g: dict, inputs: dict, painted: np.ndarray, seed: int = 0):
+        self.g, self.inputs, self.painted = g, inputs, painted
+        self.rng = np.random.default_rng(seed)
+        self.cache: dict = {}
+
+    def __call__(self, link: list) -> np.ndarray:
+        nid = link[0]
+        if nid in self.inputs:
+            return self.inputs[nid]
+        if nid not in self.cache:
+            self.cache[nid] = self._eval(self.g[nid])
+        return self.cache[nid]
+
+    def _eval(self, node: dict) -> np.ndarray:
+        a, kind = node["inputs"], node["class_type"]
+        if kind == "ImageCrop":
+            return self(a["image"])[a["y"]:a["y"] + a["height"], a["x"]:a["x"] + a["width"]]
+        if kind == "ImageCompositeMasked":
+            dest, src = self(a["destination"]).copy(), self(a["source"])
+            x, y = a["x"], a["y"]
+            h, w = min(src.shape[0], dest.shape[0] - y), min(src.shape[1], dest.shape[1] - x)
+            m = self(a["mask"])[:h, :w, None] if "mask" in a else 1.0
+            dest[y:y + h, x:x + w] = m * src[:h, :w] + (1 - m) * dest[y:y + h, x:x + w]
+            return dest
+        if kind == "SolidMask":
+            return np.full((a["height"], a["width"]), a["value"])
+        if kind == "MaskComposite":
+            out, src = self(a["destination"]).copy(), self(a["source"])
+            x, y = a["x"], a["y"]
+            h, w = min(src.shape[0], out.shape[0] - y), min(src.shape[1], out.shape[1] - x)
+            region = out[y:y + h, x:x + w]
+            out[y:y + h, x:x + w] = region * src[:h, :w] if a["operation"] == "multiply" else region + src[:h, :w]
+            return np.clip(out, 0, 1)
+        if kind in ("MaskToImage", "ImageToMask"):
+            return self(a["mask"] if kind == "MaskToImage" else a["image"])
+        if kind == "ImageAddNoise":
+            img = self(a["image"])
+            return np.clip(img + a["strength"] * self.rng.standard_normal(img.shape), 0, 1)
+        if kind == "ImageScale":
+            assert a["upscale_method"] == "bilinear"
+            return _upscale_bilinear(self(a["image"]), a["width"])
+        if kind == "VAEDecode":
+            return self.painted
+        raise AssertionError(f"unexpected node {kind}")
 
 
-@pytest.mark.parametrize("size, width", [(1024, 0.25), (2048, 0.25), (512, 0.125)])
-def test_seam_mask_covers_the_old_edges_and_leaves_the_new_ones(size, width):
+# -- graph wiring ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("dx, dy", [(128, 128), (64, 64), (192, 64)])
+def test_roll_is_a_wrap_around_offset(dx, dy):
+    n = 256
+    img = _rough_image(n)
     g: dict = {}
-    link = sm.add_seam_mask(g, "m_", size, width, seed=3)
-    for trial in range(3):
-        m = _mask(g, link, np.random.default_rng(trial))
-        assert m.shape == (size, size)
+    out = sm.add_roll(g, "r_", ["src", 0], n, dx, dy)
+    assert np.array_equal(_Comfy(g, {"src": img}, img)(out), np.roll(img, (dy, dx), axis=(0, 1)))
+
+
+def test_half_roll_moves_the_seam_to_the_centre():
+    img = _rough_image(256)
+    rolled = np.roll(img, (128, 128), axis=(0, 1))
+    before, after = pbr_maps.seam_metrics(img), pbr_maps.seam_metrics(rolled)
+    assert not before["ok"]
+    assert after["ok"] and not after["centre_ok"]
+
+
+@pytest.mark.parametrize("size, width", [(512, 0.25), (1024, 0.25), (1024, 0.125), (2048, 0.3), (512, 0.05)])
+def test_repaint_hides_the_whole_seam(size, width):
+    """With a repaint that draws a flat colour, the old edges (now the centre lines) must be fully
+    painted over, and most of the image must keep its pixels."""
+    img = _rough_image(size)
+    g = workflows.get("material").build(_params(size=size, seam_width=width))
+    rolled = np.roll(img, (size // 2, size // 2), axis=(0, 1))
+    for seed in range(2):
+        out = _Comfy(g, {"base_dec": img}, np.full_like(img, 0.123), seed)(g["save"]["inputs"]["images"])
         c = size // 2
-        # Fully repainted over the old edges (the centre lines, a few pixels either side) ...
-        assert m[:, c - 4:c + 4].min() == 1.0 and m[c - 4:c + 4, :].min() == 1.0
-        # ... untouched at the new edges and in the corners, so the wrap cannot change.
-        edge = int(size * (0.5 - width / 2)) - size // 32  # one mask cell outside the band
-        for corner in (m[:edge, :edge], m[:edge, -edge:], m[-edge:, :edge], m[-edge:, -edge:]):
-            assert corner.max() == 0.0
-        assert m[0, :edge].max() == 0.0 and m[:edge, 0].max() == 0.0
-        # The band's edge is ragged: the ramp is not the same along every row.
-        ramp = m[edge + size // 32: c - 8, c - size // 16]
-        assert ramp.size and 0 < ramp.mean() < 1
+        assert np.allclose(out[:, c - 2:c + 2], 0.123) and np.allclose(out[c - 2:c + 2, :], 0.123)
+        kept = np.isclose(out, rolled).all(axis=-1).mean()
+        assert 0.3 < kept < 0.97
 
 
-def test_seam_layers():
-    assert sm.seam_layers(0.25) == [8, 6, 4, 2]
-    assert sm.seam_layers(0.05) == [4, 2]
+@pytest.mark.parametrize("size, width", [(512, 0.25), (1024, 0.125), (512, 0.05)])
+def test_repaint_never_paints_across_an_edge(size, width):
+    """With a repaint that draws an image that does not tile (a stand-in for anything the model
+    might draw), the result must still wrap: no pass may repaint up to the edge of the frame it
+    paints in, or the two sides of that edge would be painted independently."""
+    img = _rough_image(size)
+    g = workflows.get("material").build(_params(size=size, seam_width=width))
+    for seed in range(2):
+        painted = _rough_image(size, seed=10 + seed)[::-1, ::-1]
+        out = _Comfy(g, {"base_dec": img}, painted, seed)(g["save"]["inputs"]["images"])
+        m = pbr_maps.seam_metrics(out)
+        assert m["ok"] and m["x"]["ratio"] < 2 and m["y"]["ratio"] < 2
+        # Where the edges were not repainted, they are the original's pixels, side by side again.
+        rolled = np.roll(img, (size // 2, size // 2), axis=(0, 1))
+        assert np.isclose(out[0], rolled[0]).all(axis=-1).mean() > 0.6
+
+
+def test_text_graph_wiring():
+    p = _params()
+    g = workflows.get("material").build(p)
+    assert g["z_text"]["inputs"]["text"].startswith("grey rock, seamless tileable texture")
+    assert g["base_sample"]["inputs"]["denoise"] == 1 and g["base_latent"]["inputs"]["width"] == 1024
+    assert g["roll_crop0"]["inputs"]["image"] == ["base_dec", 0]
+    # Each pass: encode -> noise mask -> sampler (partial denoise) -> decode -> masked composite.
+    for ns, mask in (("pass_", "seam_mask"), ("pass2_", "spot_mask")):
+        assert g[ns + "noise_mask"]["inputs"] == {"samples": [ns + "enc", 0], "mask": [mask, 0]}
+        assert g[ns + "sample"]["inputs"]["latent_image"] == [ns + "noise_mask", 0]
+        assert g[ns + "sample"]["inputs"]["denoise"] == 0.7
+        comp = g[ns + "out"]["inputs"]
+        assert comp["destination"] == g[ns + "enc"]["inputs"]["pixels"] and comp["source"] == [ns + "dec", 0]
+        assert comp["mask"] == [mask, 0]
+    assert g["pass_enc"]["inputs"]["pixels"] == ["roll_paste3", 0]
+    assert g["pass2_enc"]["inputs"]["pixels"] == ["quarter_paste3", 0]
+    assert g["save"]["inputs"]["images"] == ["back_paste3", 0]
+    assert g["save_untiled"]["inputs"]["images"] == ["base_dec", 0]
+
+
+def test_mask_layers():
+    layers = sm.cross_layers(0.25)
+    assert [r[0][2] for r in layers] == [16, 14, 12, 10, 8, 6, 4, 2]
+    assert min(r[0][1] for r in layers) == 1  # one clear cell at the edges
+    assert sm.cross_gap(0.25) == 4
+    spots = sm.patch_layers(0.25)
+    for rects in spots:
+        for x, y, w, h in rects:
+            assert x >= 1 and y >= 1 and x + w <= sm.MASK_CELLS - 1 and y + h <= sm.MASK_CELLS - 1
 
 
 def test_reference_uses_klein_and_source_can_skip_the_roll():

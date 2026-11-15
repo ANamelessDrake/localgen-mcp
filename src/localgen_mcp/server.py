@@ -557,13 +557,15 @@ async def generate_material(
     wording is added. size 1024 (default) or 2048 (512 to 2048, a multiple of 64). reference_image: a
     picture whose colours and material to follow (FLUX.2 Klein). tile_image: make this existing image
     tileable instead of generating one (the prompt still guides the seam repaint).
-    How it tiles: the image is offset by half its size with wrap around, then a cross shaped band
-    over the old edges (seam_width 0.05 to 0.3 of the size across, default 0.25, ragged soft edges)
-    is repainted image to image under that mask (Z-Image Turbo) and composited back, so nothing
-    outside the band changes. seam_denoise (0.3 to 1.0, default 0.7) is how freely: higher hides a
-    stubborn seam but drifts from the surrounding texture. The wrap and the repainted centre are
-    then measured; while the centre still shows a line, the band is repainted again (seam_passes in
-    all, default 2; a pass is kept only if it helps).
+    How it tiles: the image is offset by half its size with wrap around, then the cross where the old
+    edges meet is repainted image to image under a soft, ragged mask (Z-Image Turbo) and only the
+    masked part composited back; the arms stop short of the edges and the leftover spots are
+    repainted after a further quarter offset, so no repaint ever crosses an edge and the result
+    wraps exactly. seam_width (0.05 to 0.3 of the size, default 0.25) is how wide the band is;
+    seam_denoise (0.3 to 1.0, default 0.7) how freely it is repainted: higher hides a stubborn seam
+    but drifts from the surrounding texture. The wrap and the repainted centre are then measured;
+    while the centre still shows a line, the repaint runs again (seam_passes in all, default 2; a
+    rerun is kept only if it helps).
     Maps, derived from the base color in Blender on the CPU, all tiling: height (16 bit; luminance,
     high pass, light blur; brighter is higher, invert_height=True for the reverse), normal (tangent
     space, OpenGL +Y green up as Unity and Blender expect; directx_normal=True writes DirectX -Y for
