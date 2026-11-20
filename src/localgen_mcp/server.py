@@ -26,7 +26,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, cutout, jobs, materials, model_files, retopo, rig, speech, workflows
+from . import backend, blender_run, config, cutout, jobs, materials, model_files, retopo, rig, speech, sprites, workflows
 from .workflows.image_edit import edit_images
 from .workflows.part_isolate import part_prompt
 
@@ -860,6 +860,250 @@ async def remove_background(
     logger.info("remove_background: %d image(s) trim=%s square=%s size=%s", len(images or []), trim, square, size)
     return await cutout.remove_background(settings, images, trim, padding, square, size, background, output_dir,
                                           idle_timeout_seconds, TIMEOUTS["image"], _progress(ctx))
+
+
+# -- pixel art sprites ----------------------------------------------------
+
+_PIXEL_DOC = """
+    Pixel pass (shared by every sprite tool, see pixelize): the subject is scaled onto a size x size
+    cell, blurred by `blur` (0.5 default, 0 plain nearest neighbour) and sampled with nearest neighbour,
+    alpha cut to fully opaque or fully transparent, colours mapped to `palette` in a perceptual colour
+    space, stray pixels removed, and a 1 pixel outline drawn round the silhouette.
+    palette: None or "auto" extracts at most max_colors (default 32) colours from the image itself; a
+    shipped palette name ("moriveil", 32 warm colours); a .gpl file, a text file of #rrggbb lines or an
+    image whose colours are the palette; or a list of "#rrggbb". With more palette entries than
+    max_colors the most used ones are kept. One colour slot is kept for the outline, so a sprite never
+    uses more than max_colors colours."""
+
+_STYLE_DOC = """
+    style: a preset ("cartoon" default: warm cartoon game art, chunky dark outlines, three tone cel
+    shading, saturated; "grim": muted dark roguelike, black outlines, two tones; "painterly": soft,
+    no outline; "flat": flat colours, no outline) or free text describing the art style. outline,
+    outline_color ("auto" = a darker palette colour of whatever the outline borders, "darkest", or
+    "#rrggbb"), shading_steps (1 to 8 tones per colour: prompt wording, and with an auto palette the
+    palette is built as hue families of that many tones) and saturation (1 keeps it) override the
+    preset."""
+
+
+def _pixel_doc(fn):
+    """Append the shared pixel pass description to a sprite tool's docstring (before registration);
+    the generators also get the style description."""
+    style = _STYLE_DOC if fn.__name__ != "pixelize" else ""
+    fn.__doc__ = fn.__doc__.rstrip() + "\n" + _PIXEL_DOC + style
+    return fn
+
+
+@mcp.tool()
+@_pixel_doc
+async def generate_sprite(
+    prompt: str,
+    size: int = 64,
+    palette: str | list[str] | None = None,
+    max_colors: int = 32,
+    style: str | None = None,
+    outline: bool | None = None,
+    outline_color: str | None = None,
+    shading_steps: int | None = None,
+    saturation: float | None = None,
+    blur: float = 0.5,
+    style_images: list[str] | None = None,
+    views: str = "front",
+    anchor: str = "bottom",
+    name: str | None = None,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """One pixel art game sprite on a transparent background at an exact size (size x size, 8 to 512).
+
+    prompt describes the subject ("a stout miner with a pickaxe"); the style's wording is added. It
+    is drawn large (1024, Z-Image Turbo; with style_images, up to 4 pictures whose art style to copy,
+    FLUX.2 Klein), the background removed (BiRefNet), then pixelized. anchor "bottom" (default) puts
+    the subject's feet on the cell's bottom edge, centred on its mass; "center" centres it.
+    views="turnaround" instead makes front, left, back and right sprites at one scale with one shared
+    palette, from generate_turnaround's views of the drawing (about 4 times the GPU time).
+    Output (<output_dir or /ai/output/localgen/sprite/<date>>): <name>_<seed>.png (the sprite),
+    _x8.png (an 8x preview), _source.png (the full resolution cut-out, to fix by hand in Aseprite and
+    run through pixelize again), _raw.png (the drawing), _palette.gpl (with an auto palette).
+    Returns the paths, palette, colours used, scale (source pixels per sprite pixel), seed and the
+    style settings used. About 10 to 20 s warm. Results are placeholder quality until an artist
+    passes over them.
+    """
+    return await sprites.generate_sprite(
+        settings, prompt, size=size, palette=palette, max_colors=max_colors, style=style, outline=outline,
+        outline_color=outline_color, shading_steps=shading_steps, saturation=saturation, blur=blur,
+        style_images=style_images, views=views, anchor=anchor, seed=seed, name=name, output_dir=output_dir,
+        idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx),
+        turnaround=generate_turnaround)
+
+
+@mcp.tool()
+@_pixel_doc
+async def generate_animation(
+    sprite_or_prompt: str,
+    action: str,
+    frames: int = 6,
+    size: int = 64,
+    palette: str | list[str] | None = None,
+    max_colors: int = 32,
+    style: str | None = None,
+    outline: bool | None = None,
+    outline_color: str | None = None,
+    shading_steps: int | None = None,
+    saturation: float | None = None,
+    blur: float = 0.5,
+    subject: str | None = None,
+    frame_prompts: list[str] | None = None,
+    retries: int = 2,
+    min_iou: float | None = None,
+    max_hist_distance: float | None = None,
+    fps: int | None = None,
+    name: str | None = None,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """An animation strip for one character: frames (2 to 16) of size x size pixel art.
+
+    sprite_or_prompt: an image of the character (a generate_sprite _raw.png or _source.png is best; a
+    finished small sprite is scaled up to serve as the reference) or a prompt, from which a base
+    sprite is made first with generate_sprite. subject: a few words naming the character, used in
+    every frame's prompt (default the prompt). action: "idle", "walk", "chop", "attack", "hurt",
+    "die" (presets with per frame poses, frame rate and thresholds) or any other word with
+    frame_prompts (one pose description per frame) or a generic cycle.
+    Each frame is a FLUX.2 Klein edit of the base drawing (image 1) with the previous frame as image
+    2 and a prompt for that frame's pose, cut out, and pixelized at the base sprite's scale with the
+    base sprite's palette, so colours cannot drift. Frame consistency is measured against the base
+    sprite: hist_distance (colour histogram distance, 0 same, 1 nothing shared) and iou (silhouette
+    overlap); a frame under the action's thresholds (min_iou, max_hist_distance override them) is
+    drawn again with a new seed, up to `retries` times, keeping the best attempt.
+    Diffusion does not keep a character the same across frames: expect changed details (a beard, a
+    belt, the tool) and poses that do not flow; look at the frames and the GIF, and treat the result
+    as a placeholder or a reference for an artist.
+    Output: <name>_<action>_<seed>_strip.png (frames left to right), _fNN.png frames, .json (frame
+    count, size, fps, loop, palette, per frame metrics), _preview.gif, _contact.png, plus each frame's
+    drawing and cut-out. About 8 to 15 s per frame warm.
+    """
+    return await sprites.generate_animation(
+        settings, sprite_or_prompt, action, frames=frames, size=size, palette=palette, max_colors=max_colors,
+        style=style, outline=outline, outline_color=outline_color, shading_steps=shading_steps,
+        saturation=saturation, blur=blur, subject=subject, frame_prompts=frame_prompts, retries=retries,
+        min_iou=min_iou, max_hist_distance=max_hist_distance, fps=fps, seed=seed, name=name, output_dir=output_dir,
+        idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx))
+
+
+@mcp.tool()
+@_pixel_doc
+async def generate_tileset(
+    prompt: str | None = None,
+    kinds: list[str | dict] | None = None,
+    preset: str | None = None,
+    size: int = 64,
+    palette: str | list[str] | None = None,
+    max_colors: int = 32,
+    style: str | None = None,
+    outline: bool | None = None,
+    outline_color: str | None = None,
+    shading_steps: int | None = None,
+    saturation: float | None = None,
+    blur: float = 0.5,
+    columns: int | None = None,
+    name: str | None = None,
+    seed: int | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Terrain and building tiles, all pixelized to one grid and one palette, packed on one sheet.
+
+    kinds: the tiles to make, each a name ("grass") or {"name", "prompt", "seamless", "transparent"}.
+    seamless=True: a ground texture that wraps (the generate_material seam repaint, then a wrapping
+    blur, so the pixel tile still tiles); transparent (default for non seamless kinds): an object cut
+    out on a transparent cell, with the style's outline; transparent=False: an opaque tile filling
+    the cell. Without kinds, preset "strategy" (default) gives grass, forest, stump, rock, gravel,
+    water edge, wood and stone walls, gate open and closed, tower, home, hearth, farm empty and ripe,
+    and raider camp. prompt: a theme added to every tile ("medieval fantasy village").
+    With an auto palette all tiles share one palette extracted from all of them.
+    Output: <name>_<seed>_sheet.png (power of two, uniform cells, left to right and top to bottom),
+    _atlas.json, _contact.png (labelled, for review), and each tile's PNG, drawing and cut-out.
+    Not made: auto tiling transition sets (the 47 tile blob). About 10 s per tile warm.
+    """
+    return await sprites.generate_tileset(
+        settings, prompt, kinds=kinds, preset=preset, size=size, palette=palette, max_colors=max_colors, style=style,
+        outline=outline, outline_color=outline_color, shading_steps=shading_steps, saturation=saturation, blur=blur,
+        columns=columns, seed=seed, name=name, output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds,
+        timeout=TIMEOUTS["image"], progress=_progress(ctx))
+
+
+@mcp.tool()
+async def pack_sheet(
+    images: list[str | dict],
+    cell: int | list[int] | None = None,
+    columns: int | None = None,
+    name: str | None = None,
+    padding: int = 0,
+    align: str = "bottom",
+    power_of_two: bool = True,
+    output_dir: str | None = None,
+) -> dict:
+    """Pack sprites or frames into one sprite sheet PNG with a JSON atlas, ready for Unity's Sprite Editor.
+
+    images: paths, or {"name", "path"} (names default to the file names). cell: the cell size in
+    pixels (int or [w, h]; default the largest image); smaller images sit in their cell centred
+    horizontally, at the bottom (align "bottom", default) or the middle ("center"). columns: cells
+    per row (default about square). padding: pixels between cells. power_of_two (default True) pads
+    the sheet to power of two sides; cells stay uniform, so Unity slices it with Grid By Cell Size
+    (pixel size = cell, padding as given, offset 0).
+    Output (<output_dir or /ai/output/localgen/sprite/<date>>): <name>.png, <name>.json (sheet size,
+    cell size, and per cell name, x, y, w, h from the top left, plus unity_y from the bottom left)
+    and <name>_contact.png (each cell enlarged on a checkerboard with its name, for review).
+    CPU only, a second or two.
+    """
+    return await sprites.pack_sheet(settings, images, cell=cell, columns=columns, name=name, padding=padding,
+                                    align=align, power_of_two=power_of_two, output_dir=output_dir)
+
+
+@mcp.tool()
+@_pixel_doc
+async def pixelize(
+    image: str,
+    size: int = 64,
+    palette: str | list[str] | None = None,
+    max_colors: int = 32,
+    outline: bool = True,
+    outline_color: str = "auto",
+    fit: str = "trim",
+    anchor: str = "center",
+    blur: float = 0.5,
+    saturation: float = 1.0,
+    shading_steps: int | None = None,
+    wrap: bool = False,
+    remove_background: bool = False,
+    name: str | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Turn any image (a drawing, a render, a hand painted file) into pixel art at an exact size.
+
+    fit: "trim" (default) scales the subject (its non transparent box) to fill the cell; "frame"
+    scales the whole image (keeps one scale across images framed alike); "fill" stretches the whole
+    image onto the cell (opaque tiles; with wrap=True the blur wraps, so a seamless image stays
+    seamless). The transparency of the image is kept (cut to fully on or off); for an image without
+    transparency pass remove_background=True to cut the subject out first with BiRefNet (GPU), or
+    fit="fill" for a tile. anchor: "center" or "bottom" (feet on the bottom edge).
+    Output (<output_dir or /ai/output/localgen/sprite/<date>>): <name>_px<size>.png, an 8x preview,
+    and the palette used (.gpl) when it was extracted. Returns the paths, palette, colours used and
+    scale. CPU only (under a second) unless remove_background.
+    """
+    return await sprites.pixelize(
+        settings, image, size=size, palette=palette, max_colors=max_colors, outline=outline,
+        outline_color=outline_color, fit=fit, anchor=anchor, blur=blur, saturation=saturation,
+        shading_steps=shading_steps, wrap=wrap, remove_background=remove_background, name=name,
+        output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"],
+        progress=_progress(ctx))
 
 
 # -- speech ---------------------------------------------------------------

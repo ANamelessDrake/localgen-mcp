@@ -1,0 +1,38 @@
+GIMP Palette
+Name: Moriveil
+Columns: 8
+#
+# 32 warm colours for a cartoon strategy game at 64 px per tile.
+# Ramps run shadow, base, highlight. The first entry is the darkest (outlines).
+ 31  23  32	outline
+ 66  44  46	dark brown shadow
+138  79  58	skin shadow
+208 138  98	skin
+242 195 154	skin highlight
+ 90  46  28	beard shadow
+163  83  42	beard
+224 138  60	beard highlight
+ 47  74  36	goblin shadow
+ 92 138  46	goblin
+156 194  74	goblin highlight
+ 74  44  28	wood shadow
+124  74  42	wood
+176 122  69	wood highlight
+ 62  63  74	stone shadow
+110 111 120	stone
+166 166 172	stone light
+216 213 204	stone highlight
+ 58 107  42	grass shadow
+106 163  58	grass
+168 208  90	grass highlight
+ 31  74 110	water deep
+ 58 127 176	water
+126 196 224	water highlight
+168  50  50	cloth red
+224  90  58	cloth red light
+ 46  79 156	cloth blue
+224 168  40	gold
+248 224 128	gold highlight
+217 184 120	sand
+ 90  58 110	purple
+255 244 224	cream

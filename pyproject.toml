@@ -19,6 +19,12 @@ retopo = [
     "numpy==1.26.4",
     "pynanoinstantmeshes==0.0.3",
 ]
+# Pixel art sprite tools (generate_sprite, pixelize, pack_sheet, ...): the pixel pass runs in a
+# child process (src/localgen_mcp/pixel_ops.py) with these; the server process never imports them.
+sprites = [
+    "numpy==1.26.4",
+    "pillow==13.0.0",
+]
 dev = [
     "pytest==9.2.0",
     "trimesh==5.2.1",
