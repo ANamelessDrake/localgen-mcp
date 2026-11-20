@@ -870,8 +870,9 @@ _PIXEL_DOC = """
     alpha cut to fully opaque or fully transparent, colours mapped to `palette` in a perceptual colour
     space, stray pixels removed, and a 1 pixel outline drawn round the silhouette.
     palette: None or "auto" extracts at most max_colors (default 32) colours from the image itself; a
-    shipped palette name ("moriveil", 32 warm colours); a .gpl file, a text file of #rrggbb lines or an
-    image whose colours are the palette; or a list of "#rrggbb". With more palette entries than
+    shipped palette name ("moriveil", 32 warm colours); a list of "#rrggbb"; or a .gpl, .hex or .txt
+    file (one #rrggbb per line) or a .png whose colours are the palette, which must sit under the
+    output folder (/ai/output/localgen) or /ai/tmp; text palettes must parse fully as colours. With more palette entries than
     max_colors the most used ones are kept. One colour slot is kept for the outline, so a sprite never
     uses more than max_colors colours."""
 

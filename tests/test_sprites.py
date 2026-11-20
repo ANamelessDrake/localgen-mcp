@@ -22,6 +22,7 @@ from localgen_mcp import config, pixel_ops as po, sprites
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 PALETTE = sprites.PALETTE_DIR / "moriveil.gpl"
+PAL = po.read_palette(sprites.read_text_palette(PALETTE))
 
 
 # -- fixtures ----------------------------------------------------------------
@@ -75,7 +76,7 @@ def test_output_is_exactly_the_cell_size(size):
 
 @pytest.mark.parametrize("max_colors", [32, 12, 5])
 def test_colours_come_from_the_palette_and_never_exceed_it(max_colors):
-    pal = po.read_palette(PALETTE)
+    pal = PAL
     out, rep = po.pixelize_array(character(), 64, palette=pal, max_colors=max_colors)
     used = colours(out)
     assert used <= {tuple(int(v) for v in c) for c in pal}
@@ -100,7 +101,7 @@ def test_shading_steps_build_tone_ramps():
 
 
 def test_outline_ring_in_the_outline_colour():
-    pal = po.read_palette(PALETTE)
+    pal = PAL
     dark = tuple(int(v) for v in pal[0])  # the palette's darkest entry, listed first
     out, rep = po.pixelize_array(character(), 64, palette=pal, outline=True, outline_color="darkest")
     mask = out[..., 3] == 255
@@ -116,7 +117,7 @@ def test_outline_ring_in_the_outline_colour():
 
 
 def test_auto_outline_is_darker_than_what_it_borders():
-    pal = po.read_palette(PALETTE)
+    pal = PAL
     flat, body, _ = po.cell_colours(character(), 64)
     rgb = po.quantise(flat, body, pal, pal[0])
     out, mask = po.add_outline(rgb, body, pal, pal[0], "auto")
@@ -173,7 +174,7 @@ def test_wrap_keeps_a_seamless_image_seamless():
     img[..., 0] = 0.5 + 0.4 * np.sin(2 * np.pi * 3 * xx)
     img[..., 1] = 0.5 + 0.4 * np.cos(2 * np.pi * 2 * yy)
     img[..., 2] = 0.4
-    pal = po.read_palette(PALETTE)
+    pal = PAL
     a, _ = po.pixelize_array(img, 64, palette=pal, fit="fill", outline=False, wrap=True, blur=2)
     b, _ = po.pixelize_array(np.roll(img, 16, axis=1), 64, palette=pal, fit="fill", outline=False, wrap=True, blur=2)
     assert (np.roll(a, 1, axis=1) == b).all()
@@ -238,7 +239,8 @@ def test_bad_options_rejected():
 
 
 def test_shipped_palette():
-    pal = po.read_palette(PALETTE)
+    hexes = sprites.read_text_palette(PALETTE)
+    pal = po.read_palette(hexes)
     assert len(pal) == 32
     lab = po.oklab(pal.astype(float))
     assert lab[:, 0].argmin() == 0  # the darkest (outline) colour is listed first
@@ -250,7 +252,7 @@ def test_palette_sources(tmp_path):
     assert po.read_palette(hexes).tolist() == [[16, 32, 48], [160, 176, 192], [255, 0, 0]]
     txt = tmp_path / "p.hex"
     txt.write_text("; a comment\n102030\n#a0b0c0\n")
-    assert len(po.read_palette(txt)) == 2
+    assert sprites.read_text_palette(txt) == ["#102030", "#a0b0c0"]
     img = np.zeros((4, 4, 4), dtype=np.uint8)
     img[..., 3] = 255
     img[:2, :, :3] = [10, 20, 30]
@@ -260,20 +262,94 @@ def test_palette_sources(tmp_path):
     assert len(po.read_palette(png)) == 2
     with pytest.raises(ValueError):
         po.read_palette(["#000000"])
+    with pytest.raises(ValueError):
+        po.read_palette(txt)  # the helper reads only lists and PNGs
 
 
-def test_resolve_palette(tmp_path):
-    assert sprites.resolve_palette(None) is None and sprites.resolve_palette("auto") is None
-    assert sprites.resolve_palette("moriveil") == str(PALETTE)
-    assert sprites.resolve_palette(["a83232", "#000000"]) == ["#a83232", "#000000"]
+def test_resolve_palette(tmp_path, settings):
+    assert sprites.resolve_palette(settings, None) is None and sprites.resolve_palette(settings, "auto") is None
+    assert sprites.resolve_palette(settings, "moriveil") == sprites.read_text_palette(PALETTE)
+    assert sprites.resolve_palette(settings, ["a83232", "#000000"]) == ["#a83232", "#000000"]
+    for bad in ("no_such_palette", ["#zzzzzz", "#000000"]):
+        with pytest.raises(ValueError):
+            sprites.resolve_palette(settings, bad)
+    staged = settings.root / "tmp"
+    staged.mkdir(parents=True, exist_ok=True)
+    good = staged / "mine.gpl"
+    good.write_text("GIMP Palette\nName: mine\nColumns: 2\n#\n 10 20 30 dark\n200 100 50\tlight\n")
+    assert sprites.resolve_palette(settings, str(good)) == ["#0a141e", "#c86432"]
+    outside = tmp_path / "elsewhere.gpl"
+    outside.write_text(good.read_text())
+    with pytest.raises(ValueError, match="must be under"):
+        sprites.resolve_palette(settings, str(outside))
+    wrong_suffix = staged / "blob.bin"
+    wrong_suffix.write_bytes(bytes(range(256)) * 4)
     with pytest.raises(ValueError):
-        sprites.resolve_palette("no_such_palette")
-    with pytest.raises(ValueError):
-        sprites.resolve_palette(["#zzzzzz", "#000000"])
-    blob = tmp_path / "blob.bin"
-    blob.write_bytes(bytes(range(256)) * 4)
-    with pytest.raises(ValueError):
-        sprites.resolve_palette(str(blob))
+        sprites.resolve_palette(settings, str(wrong_suffix))
+    fake_png = staged / "fake.png"
+    fake_png.write_text("#000000\n#ffffff\n")
+    with pytest.raises(ValueError, match="not a PNG"):
+        sprites.resolve_palette(settings, str(fake_png))
+
+
+SECRET = "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"
+
+
+@pytest.mark.parametrize("suffix,body", [
+    (".txt", f"#102030\n{SECRET}\n#ffffff\n"),
+    (".gpl", f"GIMP Palette\nName: x\n 1 2 3\n{SECRET}\n"),
+    (".hex", f"{SECRET}\n"),
+    (".txt", "token=" + SECRET + "\n"),
+])
+def test_non_palette_file_rejected_without_echoing_it(settings, suffix, body):
+    """A file that is not a palette is refused, and nothing of its contents reaches the error."""
+    staged = settings.root / "tmp"
+    staged.mkdir(parents=True, exist_ok=True)
+    path = staged / f"notes{suffix}"
+    path.write_text(body)
+    with pytest.raises(ValueError) as info:
+        sprites.resolve_palette(settings, str(path))
+    msg = str(info.value)
+    assert "line" in msg or "colours" in msg
+    for fragment in (SECRET[:12], "OPENSSH", "b3BlbnNz", "token"):
+        assert fragment not in msg
+
+
+def test_secret_outside_the_allowed_folders_is_never_read(settings, tmp_path, monkeypatch):
+    key = tmp_path / "id_ed25519.txt"
+    key.write_text(SECRET + "\n")
+    reads = []
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: reads.append(self) or real(self))
+    with pytest.raises(ValueError) as info:
+        sprites.resolve_palette(settings, str(key))
+    assert key not in reads and "OPENSSH" not in str(info.value)
+
+
+def test_helper_errors_never_echo_colour_text():
+    with pytest.raises(ValueError) as info:
+        po.read_palette(["#000000", SECRET])
+    assert "OPENSSH" not in str(info.value) and "entry 2" in str(info.value)
+    with pytest.raises(ValueError) as info:
+        po.hex_colour(SECRET)
+    assert "OPENSSH" not in str(info.value)
+
+
+def test_helper_failure_details_stay_in_the_server_log(settings, tmp_path, caplog):
+    """A helper crash returns a short error; its traceback goes to the server log only."""
+    bogus = tmp_path / "broken.png"
+    bogus.write_bytes(b"\x89PNG\r\n\x1a\n" + SECRET.encode())
+    spec = {"op": "pixelize", "size": 16, "palette": None, "items": [{"input": str(bogus), "output": str(tmp_path / "o.png")}]}
+    with caplog.at_level("ERROR", logger="localgen_mcp.sprites"):
+        with pytest.raises(sprites.PixelError) as info:
+            asyncio.run(sprites.run_ops(settings, spec, tmp_path / "o.png"))
+    assert "server log" in str(info.value) and "Traceback" not in str(info.value)
+    assert "Traceback" in caplog.text
+    # A ValueError raised inside the helper comes back as its own short message.
+    spec = {"op": "pack", "images": [], "sheet": str(tmp_path / "s.png"), "atlas": str(tmp_path / "s.json"),
+            "contact": str(tmp_path / "c.png")}
+    with pytest.raises(sprites.PixelError, match="no images to pack"):
+        asyncio.run(sprites.run_ops(settings, spec, tmp_path / "s.png"))
 
 
 # -- sheets ------------------------------------------------------------------

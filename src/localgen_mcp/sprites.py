@@ -5,7 +5,8 @@ Built on the existing pipeline, no second one:
                the seamless material workflow for ground tiles, and generate_turnaround for views
   cut-out      cutout.remove_background (BiRefNet)
   pixel pass   pixel_ops.py, a numpy and Pillow helper run as a child process with this
-               interpreter (blender_run.run_reporting reads its final "PIXEL_OPS_RESULT {json}" line)
+               interpreter; run_ops reads its final "PIXEL_OPS_RESULT {json}" line and logs (never
+               returns) anything else it prints
 
 This module only orchestrates; like the rest of the MCP server process it imports no imaging
 library. Nothing here is specific to one game: style, palette, cell size, outline, shading steps
@@ -14,7 +15,9 @@ and the tile kinds are parameters, and STYLES and TILE_PRESETS only hold default
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import random
 import re
@@ -28,7 +31,10 @@ from . import blender_run, cutout, jobs, workflows
 from .config import Settings
 from .workflows.image_edit import edit_images
 
+logger = logging.getLogger("localgen_mcp.sprites")
+
 MARKER = "PIXEL_OPS_RESULT"
+ERROR_MARKER = "PIXEL_OPS_ERROR"
 HELPER = Path(__file__).parent / "pixel_ops.py"
 PALETTE_DIR = Path(__file__).parent / "palettes"
 TIMEOUT = int(os.environ.get("LOCALGEN_TIMEOUT_PIXEL", 600))
@@ -140,10 +146,55 @@ def shipped_palettes() -> dict[str, Path]:
     return {p.stem: p for p in sorted(PALETTE_DIR.glob("*.gpl"))}
 
 
-def resolve_palette(palette: str | list[str] | None) -> str | list[str] | None:
-    """None for an auto palette; else a list of "#rrggbb" or the path of a palette file the helper
-    reads: a shipped palette name ("moriveil"), a GPL file, a text file of hex colours, or an image
-    whose distinct colours are the palette."""
+PALETTE_SUFFIXES = (".gpl", ".hex", ".txt", ".png")
+PALETTE_MAX_BYTES = 1 << 20
+_PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def palette_roots(settings: Settings) -> list[Path]:
+    """Where a palette file may be read from: the shipped palettes, the output folder and the
+    install's tmp folder (inputs staged for tools). A palette path is never read from anywhere
+    else, so the parameter cannot be pointed at arbitrary files."""
+    return [PALETTE_DIR.resolve(), settings.output_dir.resolve(), (settings.root / "tmp").resolve()]
+
+
+def read_text_palette(path: Path) -> list[str]:
+    """Colours of a GPL file or a hex list (one #rrggbb per line, ";" comments), parsed strictly:
+    every line must be a colour, a comment, blank, or a GPL header line, else the file is rejected.
+    Errors give only a line number, never the line."""
+    try:
+        lines = path.read_bytes().decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("palette file is not UTF-8 text") from None
+    gpl = bool(lines) and lines[0].strip() == "GIMP Palette"
+    cols = []
+    for n, line in enumerate(lines[1:] if gpl else lines, start=2 if gpl else 1):
+        text = line.strip()
+        if not text or text.startswith("#" if gpl else ";"):
+            continue
+        if gpl:
+            if re.match(r"^(Name|Columns):", text):
+                continue
+            parts = text.split()
+            if len(parts) >= 3 and all(p.isdigit() and int(p) <= 255 for p in parts[:3]):
+                cols.append("#%02x%02x%02x" % tuple(int(p) for p in parts[:3]))
+                continue
+        else:
+            word = text.split()[0]
+            if _HEX.match(word):
+                cols.append("#" + word.lstrip("#").lower())
+                continue
+        raise ValueError(f"palette file line {n} is not a colour")
+    if not 2 <= len(cols) <= 256:
+        raise ValueError(f"a palette file needs 2 to 256 colours, found {len(cols)}")
+    return cols
+
+
+def resolve_palette(settings: Settings, palette: str | list[str] | None) -> str | list[str] | None:
+    """None for an auto palette; else a list of "#rrggbb", or the path of a PNG whose colours the
+    helper reads. palette: a shipped palette name ("moriveil"), a list of colours, or a .gpl, .hex,
+    .txt or .png file under palette_roots(). Text files are parsed here, so only colours reach the
+    helper; errors never quote file contents."""
     if palette is None or palette == "auto" or palette == []:
         return None
     if isinstance(palette, list):
@@ -152,19 +203,23 @@ def resolve_palette(palette: str | list[str] | None) -> str | list[str] | None:
         return ["#" + c.strip().lstrip("#") for c in palette]
     shipped = shipped_palettes()
     if palette in shipped:
-        return str(shipped[palette])
+        return read_text_palette(shipped[palette])
     path = Path(palette).expanduser().resolve()
+    if path.suffix.lower() not in PALETTE_SUFFIXES:
+        raise ValueError(f"palette must be a shipped name ({sorted(shipped)}) or a "
+                         f"{', '.join(PALETTE_SUFFIXES)} file")
+    if not any(path.is_relative_to(root) for root in palette_roots(settings)):
+        raise ValueError(f"a palette file must be under {settings.output_dir} or {settings.root / 'tmp'} "
+                         "(copy it there), or be a shipped palette")
     if not path.is_file():
-        raise ValueError(f"palette {palette!r} is not a shipped palette ({sorted(shipped)}) or a file")
-    if path.stat().st_size > 8 << 20:
-        raise ValueError(f"palette file too large: {path}")
-    if not jobs.is_image_file(path):
-        head = path.read_bytes()[:4096]
-        try:
-            head.decode("utf-8")
-        except UnicodeDecodeError:
-            raise ValueError(f"palette must be a GPL file, a text list of hex colours or an image: {path}") from None
-    return str(path)
+        raise ValueError(f"palette file not found: {path}")
+    if path.stat().st_size > PALETTE_MAX_BYTES:
+        raise ValueError("palette file too large")
+    if path.suffix.lower() == ".png":
+        if path.read_bytes()[:8] != _PNG:
+            raise ValueError("palette .png is not a PNG image")
+        return str(path)
+    return read_text_palette(path)
 
 
 def image_input(raw: str, what: str) -> Path:
@@ -200,17 +255,41 @@ def out_dir(settings: Settings, output_dir: str | None) -> Path:
 
 
 async def run_ops(settings: Settings, spec: dict, expect: Path) -> dict:
-    """Run one pixel_ops operation in a child process (this interpreter, -I) and return its report."""
+    """Run one pixel_ops operation in a child process (this interpreter, -I) and return its report.
+
+    The child's output is logged here, never returned: a failure reaches the client only as the
+    helper's own PIXEL_OPS_ERROR message (a ValueError raised in pixel_ops, which never quotes file
+    contents) or a short generic error."""
     work = settings.root / "tmp"
     work.mkdir(parents=True, exist_ok=True)
     spec_path = work / f"pixel-{uuid.uuid4().hex[:10]}.json"
     spec_path.write_text(json.dumps(spec))
+    cmd = [blender_run.PYTHON, "-I", str(HELPER), str(spec_path)]
+    op = spec.get("op")
     try:
-        cmd = [blender_run.PYTHON, "-I", str(HELPER), str(spec_path)]
-        return await blender_run.run_reporting(cmd, MARKER, expect, TIMEOUT, {**os.environ, "TMPDIR": str(work)},
-                                               program="pixel_ops", error=PixelError)
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.PIPE,
+                                                    env={**os.environ, "TMPDIR": str(work)})
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise PixelError(f"pixel pass ({op}) timed out after {TIMEOUT} s") from None
     finally:
         spec_path.unlink(missing_ok=True)
+    stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
+    lines = stdout.splitlines()
+    for line in reversed(lines):
+        if line.startswith(ERROR_MARKER + " "):
+            raise PixelError(f"pixel pass ({op}): {json.loads(line[len(ERROR_MARKER) + 1:])}")
+    if proc.returncode == 0 and expect.is_file():
+        for line in reversed(lines):
+            if line.startswith(MARKER + " "):
+                return json.loads(line[len(MARKER) + 1:])
+    logger.error("pixel_ops %s failed (exit %s):\n%s", op, proc.returncode,
+                 "\n".join((stdout + stderr).splitlines()[-40:]))
+    raise PixelError(f"pixel pass ({op}) failed (exit {proc.returncode}); details are in the server log")
 
 
 def pixel_spec(size: int, palette, max_colors: int, style: dict, blur: float, items: list[dict],
@@ -272,7 +351,7 @@ async def generate_sprite(settings: Settings, prompt: str, *, size: int = 64, pa
         raise ValueError('views must be "front" or "turnaround"')
     check_pixel_options(size=size, max_colors=max_colors, blur=blur, anchor=anchor)
     st = resolve_style(style, outline, outline_color, shading_steps, saturation)
-    pal = resolve_palette(palette)
+    pal = resolve_palette(settings, palette)
     refs = [str(image_input(p, "style image")) for p in (style_images or []) if p]
     if len(refs) > 4:
         raise ValueError("at most 4 style_images")
@@ -416,7 +495,7 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
         raise ValueError("give an action, for example idle, walk, chop, attack, hurt or die")
     check_pixel_options(size=size, max_colors=max_colors, blur=blur)
     st = resolve_style(style, outline, outline_color, shading_steps, saturation)
-    pal = resolve_palette(palette)
+    pal = resolve_palette(settings, palette)
     poses, info = frame_poses(action, frames, frame_prompts)
     iou_min = info["iou_min"] if min_iou is None else float(min_iou)
     hist_max = info["hist_max"] if max_hist_distance is None else float(max_hist_distance)
@@ -626,7 +705,7 @@ async def generate_tileset(settings: Settings, prompt: str | None = None, *, kin
     tiles = normalise_kinds(kinds, preset)
     check_pixel_options(size=size, max_colors=max_colors, blur=blur)
     st = resolve_style(style, outline, outline_color, shading_steps, saturation)
-    pal = resolve_palette(palette)
+    pal = resolve_palette(settings, palette)
     seed = random.randint(0, 2**31 - 1) if seed is None else int(seed)
     outdir = out_dir(settings, output_dir)
     stem = unique_stem(outdir, f"{slug(name or prompt or 'tileset', 4)}_{seed}")
@@ -748,7 +827,7 @@ async def pixelize(settings: Settings, image: str, *, size: int = 64, palette=No
     src = image_input(image, "image")
     check_pixel_options(size=size, max_colors=max_colors, outline_color=outline_color, shading_steps=shading_steps,
                         saturation=saturation, blur=blur, fit=fit, anchor=anchor)
-    pal = resolve_palette(palette)
+    pal = resolve_palette(settings, palette)
     outdir = out_dir(settings, output_dir)
     stem = unique_stem(outdir, f"{slug(name or src.stem, 6)}_px{size}")
     t0 = time.time()

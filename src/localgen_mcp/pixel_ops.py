@@ -36,6 +36,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 MARKER = "PIXEL_OPS_RESULT"
+ERROR_MARKER = "PIXEL_OPS_ERROR"  # "PIXEL_OPS_ERROR {json message}": a ValueError raised here, safe to show
 ALPHA_CUT = 0.5
 FITS = ("trim", "frame", "fill")
 ANCHORS = ("center", "bottom")
@@ -64,7 +65,7 @@ def oklab(rgb: np.ndarray) -> np.ndarray:
 def hex_colour(text: str) -> tuple[int, int, int]:
     t = str(text).strip().lstrip("#")
     if len(t) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in t):
-        raise ValueError(f"not a colour like #rrggbb: {text!r}")
+        raise ValueError("not a colour like #rrggbb")  # never echo the text: it may come from any file
     return int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)
 
 
@@ -73,30 +74,29 @@ def to_hex(rgb) -> str:
 
 
 def read_palette(source) -> np.ndarray:
-    """Palette colours (k x 3, uint8) from a list of hex strings, a GPL file, a hex list file
-    (one #rrggbb per line) or an image (its distinct opaque colours, at most 256)."""
+    """Palette colours (k x 3, uint8) from a list of "#rrggbb" strings or a PNG (its distinct opaque
+    colours, at most 256). Text palette files (GPL, hex lists) are parsed by the server
+    (sprites.read_text_palette) and arrive here as lists. Errors never quote the source."""
     if isinstance(source, (list, tuple)):
-        cols = [hex_colour(c) for c in source]
+        cols = []
+        for i, c in enumerate(source):
+            try:
+                cols.append(hex_colour(c))
+            except ValueError:
+                raise ValueError(f"palette entry {i + 1} is not a colour like #rrggbb") from None
     else:
         path = Path(source)
-        head = path.read_bytes()[:16]
-        if head.startswith(b"GIMP Palette"):
-            cols = []
-            for line in path.read_text(errors="replace").splitlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
-                    cols.append(tuple(int(p) for p in parts[:3]))
-        elif not head.startswith(IMAGE_MAGIC) and not (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
-            # A text list of colours, one #rrggbb (or rrggbb) per line; ";" starts a comment line.
-            cols = [hex_colour(s.split()[0]) for s in path.read_text().splitlines()
-                    if s.strip() and not s.lstrip().startswith(";")]
-        else:
+        if not path.read_bytes()[:8] == IMAGE_MAGIC[0]:
+            raise ValueError("a palette image must be a PNG")
+        try:
             img = np.asarray(_open(path))
-            px = img.reshape(-1, 4)
-            px = px[px[:, 3] >= 128][:, :3]
-            cols = [tuple(c) for c in np.unique(px, axis=0)]
-            if len(cols) > 256:
-                raise ValueError(f"palette image has {len(cols)} colours; at most 256")
+        except (OSError, SyntaxError):
+            raise ValueError("the palette PNG could not be read") from None
+        px = img.reshape(-1, 4)
+        px = px[px[:, 3] >= 128][:, :3]
+        cols = [tuple(c) for c in np.unique(px, axis=0)]
+        if len(cols) > 256:
+            raise ValueError(f"palette image has {len(cols)} colours; at most 256")
     seen, out = set(), []
     for c in cols:
         if tuple(c) not in seen:
@@ -622,6 +622,8 @@ def op_pack(spec: dict) -> dict:
     """spec: images [{name, path}], cell [w, h] or None (largest image), columns, padding, align
     ("bottom" or "center"), power_of_two, sheet, atlas, contact (paths)."""
     entries = spec["images"]
+    if not entries:
+        raise ValueError("no images to pack")
     arrs = [load_u8(e["path"]) for e in entries]
     if spec.get("cell"):
         cw, ch = (int(v) for v in spec["cell"])
@@ -698,7 +700,13 @@ OPS = {"pixelize": op_pixelize, "metrics": op_metrics, "pack": op_pack, "flatten
 
 def main(argv: list[str]) -> int:
     spec = json.loads(Path(argv[0]).read_text())
-    result = OPS[spec["op"]](spec)
+    try:
+        result = OPS[spec["op"]](spec)
+    except ValueError as e:
+        # Messages raised in this module name the problem, never file contents; the server passes
+        # only this line to the client. Anything else exits with a traceback the server only logs.
+        print(ERROR_MARKER + " " + json.dumps(str(e)[:300]), flush=True)
+        return 2
     print(MARKER + " " + json.dumps(result), flush=True)
     return 0
 
