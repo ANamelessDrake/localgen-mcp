@@ -552,9 +552,10 @@ def load_u8(path) -> np.ndarray:
 
 
 def op_metrics(spec: dict) -> dict:
-    """spec: base (path), frames [paths]; each frame against the base and the frame before it."""
+    """spec: base (path), frames [paths], prev (optional path the first frame follows, default the
+    base); each frame against the base and against the frame before it."""
     base = load_u8(spec["base"])
-    out, prev = [], base
+    out, prev = [], load_u8(spec["prev"]) if spec.get("prev") else base
     for path in spec["frames"]:
         f = load_u8(path)
         out.append({"path": path, "hist_distance": histogram_distance(base, f), "iou": silhouette_iou(base, f),

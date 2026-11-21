@@ -959,6 +959,7 @@ async def generate_animation(
     retries: int = 2,
     min_iou: float | None = None,
     max_hist_distance: float | None = None,
+    min_motion: float | None = None,
     fps: int | None = None,
     name: str | None = None,
     seed: int | None = None,
@@ -978,11 +979,15 @@ async def generate_animation(
     2 and a prompt for that frame's pose, cut out, and pixelized at the base sprite's scale with the
     base sprite's palette, so colours cannot drift. Frame consistency is measured against the base
     sprite: hist_distance (colour histogram distance, 0 same, 1 nothing shared) and iou (silhouette
-    overlap); a frame under the action's thresholds (min_iou, max_hist_distance override them) is
-    drawn again with a new seed, up to `retries` times, keeping the best attempt.
-    Diffusion does not keep a character the same across frames: expect changed details (a beard, a
-    belt, the tool) and poses that do not flow; look at the frames and the GIF, and treat the result
-    as a placeholder or a reference for an artist.
+    overlap), and motion against the frame before it (1 - silhouette overlap; a frame that repeats
+    the previous pose fails). A frame under the action's thresholds (min_iou, max_hist_distance,
+    min_motion override them) is drawn again with a new seed and without the previous frame as image
+    2 (which pins the pose), up to `retries` times, keeping the best attempt. The result's
+    "consistency" summarises it, including static_frames (frames that barely moved).
+    Diffusion does not keep a character the same across frames, and Klein tends to hold the base
+    pose: expect changed details, small or missing limb motion (a walk often comes out as one stride
+    repeated), and poses that do not flow. Look at the frames and the GIF, and treat the result as a
+    placeholder or a reference for an artist.
     Output: <name>_<action>_<seed>_strip.png (frames left to right), _fNN.png frames, .json (frame
     count, size, fps, loop, palette, per frame metrics), _preview.gif, _contact.png, plus each frame's
     drawing and cut-out. About 8 to 15 s per frame warm.
@@ -991,7 +996,7 @@ async def generate_animation(
         settings, sprite_or_prompt, action, frames=frames, size=size, palette=palette, max_colors=max_colors,
         style=style, outline=outline, outline_color=outline_color, shading_steps=shading_steps,
         saturation=saturation, blur=blur, subject=subject, frame_prompts=frame_prompts, retries=retries,
-        min_iou=min_iou, max_hist_distance=max_hist_distance, fps=fps, seed=seed, name=name, output_dir=output_dir,
+        min_iou=min_iou, max_hist_distance=max_hist_distance, min_motion=min_motion, fps=fps, seed=seed, name=name, output_dir=output_dir,
         idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx))
 
 

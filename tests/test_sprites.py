@@ -28,7 +28,7 @@ PAL = po.read_palette(sprites.read_text_palette(PALETTE))
 # -- fixtures ----------------------------------------------------------------
 
 
-def character(size: int = 512, shift: int = 0) -> np.ndarray:
+def character(size: int = 512, shift: int = 0, stride: int = 0) -> np.ndarray:
     """A float RGBA test figure on a transparent background: head, body, legs, several colours and
     a shading gradient, standing on the bottom third."""
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
@@ -37,7 +37,9 @@ def character(size: int = 512, shift: int = 0) -> np.ndarray:
     s = size / 512
     head = np.hypot(xx - 256 * s, yy - 150 * s) < 60 * s
     body = (np.abs(xx - 256 * s) < 80 * s) & (yy > 200 * s) & (yy < 360 * s)
-    legs = ((np.abs(xx - 220 * s) < 25 * s) | (np.abs(xx - 292 * s) < 25 * s)) & (yy >= 360 * s) & (yy < 460 * s)
+    # stride swings the legs apart (a pose change, unlike shift, which the bottom anchor undoes)
+    legs = ((np.abs(xx - (220 - stride) * s) < 25 * s) | (np.abs(xx - (292 + stride) * s) < 25 * s)) \
+        & (yy >= 360 * s) & (yy < 460 * s)
     shade = 0.75 + 0.25 * (xx / size)
     img[head, :3] = np.stack([0.85 * shade, 0.55 * shade, 0.40 * shade], -1)[head]
     img[body, :3] = np.stack([0.30 * shade, 0.45 * shade, 0.75 * shade], -1)[body]
@@ -572,8 +574,9 @@ class FakeGPU:
     an RGBA PNG (so the cut-out is the drawing itself). bad lists (frame index, attempt) pairs that
     come out with a wrong silhouette and colours."""
 
-    def __init__(self, tmp: Path, bad: set[tuple[int, int]]):
-        self.tmp, self.bad, self.calls, self.n = tmp, bad, [], 0
+    def __init__(self, tmp: Path, bad: set[tuple[int, int]], static_first: bool = False):
+        # static_first: first attempts all repeat one pose (no motion); retries step sideways
+        self.tmp, self.bad, self.calls, self.n, self.static_first = tmp, bad, [], 0, static_first
         self.attempts: dict[str, int] = {}
 
     async def draw(self, settings, prompts, seeds, outdir, idle, timeout, progress, refs=None, input_image=None):
@@ -587,6 +590,8 @@ class FakeGPU:
             attempt = self.attempts.get(key, 0)
             self.attempts[key] = attempt + 1
             img = character(shift=4 * (frame or 0) % 12)
+            if self.static_first and frame is not None:
+                img = character(stride=0 if attempt == 0 else (90 if frame % 2 else 30))
             if (frame, attempt) in self.bad:
                 img = np.zeros_like(img)
                 img[40:200, 300:500] = [0.1, 0.9, 0.2, 1.0]
@@ -609,7 +614,7 @@ def test_animation_retries_a_bad_frame_and_keeps_the_better_one(tmp_path, settin
     monkeypatch.setattr(sprites, "draw", gpu.draw)
     monkeypatch.setattr(sprites, "cut", gpu.cut)
     res = asyncio.run(sprites.generate_animation(settings, "a test hero with a blue tunic", "walk", frames=4,
-                                                 size=32, seed=7, output_dir=str(tmp_path / "anim")))
+                                                 size=32, seed=7, min_motion=0.0, output_dir=str(tmp_path / "anim")))
     per = res["per_frame"]
     assert [f["attempts"] for f in per] == [1, 1, 2, 1]
     assert all(f["passed"] for f in per)
@@ -627,7 +632,9 @@ def test_animation_retries_a_bad_frame_and_keeps_the_better_one(tmp_path, settin
     # Frame prompts: the base drawing is image 1 every time, the previous frame image 2 after the first.
     frames = [c for c in gpu.calls if "This is frame" in c["prompt"]]
     assert all(c["input_image"] == res["base_reference"] for c in frames)
-    assert frames[0]["refs"] == [] and all(len(c["refs"]) == 1 for c in frames[1:])
+    first = frames[:4]  # first attempts, in frame order; the retry of frame 2 follows them
+    assert first[0]["refs"] == [] and all(len(c["refs"]) == 1 for c in first[1:])
+    assert frames[4]["refs"] == []  # a retry leaves out the previous frame
     assert Path(res["preview_gif"]).is_file()
 
 
@@ -693,3 +700,30 @@ def test_gpu_smoke_sprite_and_idle(tmp_path):
         assert anim["consistency"]["frames"] == 4
     finally:
         shutil.rmtree(out, ignore_errors=True)
+
+
+def test_animation_static_frames_fail_and_retry_without_the_previous_frame(tmp_path, settings, monkeypatch):
+    """Frames that only repeat the pose before them fail the motion check; retries leave out image 2."""
+    gpu = FakeGPU(tmp_path, bad=set(), static_first=True)
+    monkeypatch.setattr(sprites, "draw", gpu.draw)
+    monkeypatch.setattr(sprites, "cut", gpu.cut)
+    res = asyncio.run(sprites.generate_animation(settings, "a test hero", "walk", frames=4, size=64, seed=2,
+                                                 retries=1, output_dir=str(tmp_path / "anim")))
+    per = res["per_frame"]
+    assert res["thresholds"]["min_motion"] == 0.05
+    assert all(f["attempts"] == 2 for f in per)       # every first attempt repeated the pose
+    retries = [c for c in gpu.calls if "This is frame" in c["prompt"]][4:]
+    assert len(retries) == 4 and all(c["refs"] == [] for c in retries)
+    assert "previous frame" not in retries[1]["prompt"]
+    assert all(f["motion"] >= 0.05 for f in per[1:]) and all(f["passed"] for f in per)
+    assert res["consistency"]["static_frames"] == 0
+
+
+def test_static_strip_is_reported_as_failing(tmp_path, settings, monkeypatch):
+    gpu = FakeGPU(tmp_path, bad=set(), static_first=True)
+    monkeypatch.setattr(sprites, "draw", gpu.draw)
+    monkeypatch.setattr(sprites, "cut", gpu.cut)
+    res = asyncio.run(sprites.generate_animation(settings, "a test hero", "walk", frames=3, size=64, seed=2,
+                                                 retries=0, output_dir=str(tmp_path / "anim")))
+    assert res["consistency"]["frames_passed"] == 0
+    assert res["consistency"]["static_frames"] == 3

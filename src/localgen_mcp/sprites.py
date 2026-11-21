@@ -403,40 +403,41 @@ async def generate_sprite(settings: Settings, prompt: str, *, size: int = 64, pa
 
 # Pose wording per action, played in order; frame i of n uses phase floor(i * len / n). iou_min is the
 # silhouette overlap with the base sprite a frame must reach (a walk moves the legs; a fall moves
-# everything), hist_max the largest colour histogram distance.
+# everything), hist_max the largest colour histogram distance, and min_motion the least change of
+# silhouette from the previous frame (1 - IoU), so a frame that only repeats the one before fails.
 ACTIONS: dict[str, dict[str, Any]] = {
-    "idle": {"fps": 6, "loop": True, "iou_min": 0.7, "hist_max": 0.3, "phases": [
+    "idle": {"fps": 6, "loop": True, "iou_min": 0.7, "hist_max": 0.3, "min_motion": 0.0, "phases": [
         "standing relaxed in its normal pose, breathing in, chest and shoulders slightly raised",
         "standing relaxed in its normal pose, fully breathed in, head a little higher",
         "standing relaxed in its normal pose, breathing out, shoulders slightly lowered",
         "standing relaxed in its normal pose, fully breathed out, body a little lower"]},
-    "walk": {"fps": 10, "loop": True, "iou_min": 0.5, "hist_max": 0.35, "phases": [
+    "walk": {"fps": 10, "loop": True, "iou_min": 0.5, "hist_max": 0.35, "min_motion": 0.05, "phases": [
         "walking: right foot forward touching the ground, left foot behind, arms swinging opposite",
         "walking: weight down on the right foot, left foot lifting off behind",
         "walking: passing position, left leg swinging forward past the right leg, body at its highest",
         "walking: left foot forward touching the ground, right foot behind, arms swinging opposite",
         "walking: weight down on the left foot, right foot lifting off behind",
         "walking: passing position, right leg swinging forward past the left leg, body at its highest"]},
-    "chop": {"fps": 10, "loop": True, "iou_min": 0.45, "hist_max": 0.35, "phases": [
+    "chop": {"fps": 10, "loop": True, "iou_min": 0.45, "hist_max": 0.35, "min_motion": 0.08, "phases": [
         "ready stance, holding its tool in both hands at waist height",
         "winding up, lifting its tool back over its shoulder",
         "tool raised high overhead, body leaning back",
         "swinging the tool down and forward hard",
         "the tool striking low in front of it at full extension",
         "pulling the tool back up, returning to the ready stance"]},
-    "attack": {"fps": 12, "loop": False, "iou_min": 0.45, "hist_max": 0.35, "phases": [
+    "attack": {"fps": 12, "loop": False, "iou_min": 0.45, "hist_max": 0.35, "min_motion": 0.08, "phases": [
         "battle ready stance, weapon held in front",
         "drawing the weapon back to strike, weight on the back foot",
         "lunging forward, weapon swinging through",
         "full extension of the strike, weapon far forward",
         "follow through, weapon low after the strike",
         "recovering back into the battle ready stance"]},
-    "hurt": {"fps": 10, "loop": False, "iou_min": 0.5, "hist_max": 0.35, "phases": [
+    "hurt": {"fps": 10, "loop": False, "iou_min": 0.5, "hist_max": 0.35, "min_motion": 0.05, "phases": [
         "flinching from a hit, head snapped back, eyes shut",
         "recoiling backwards off balance, arms up",
         "staggering, regaining balance",
         "back in its normal pose, wary"]},
-    "die": {"fps": 8, "loop": False, "iou_min": 0.15, "hist_max": 0.4, "phases": [
+    "die": {"fps": 8, "loop": False, "iou_min": 0.15, "hist_max": 0.4, "min_motion": 0.05, "phases": [
         "hit hard, recoiling backwards",
         "staggering and losing balance, weapon or tool slipping",
         "falling to its knees",
@@ -450,8 +451,8 @@ GENERIC_FPS = 8
 def frame_poses(action: str, frames: int, frame_prompts: list[str] | None) -> tuple[list[str], dict]:
     """The pose text for each frame and the action's settings (fps, loop, thresholds)."""
     preset = ACTIONS.get(action.lower().strip())
-    info = {k: v for k, v in (preset or {"fps": GENERIC_FPS, "loop": True, "iou_min": 0.45,
-                                         "hist_max": 0.35}).items() if k != "phases"}
+    info = {k: v for k, v in (preset or {"fps": GENERIC_FPS, "loop": True, "iou_min": 0.45, "hist_max": 0.35,
+                                         "min_motion": 0.03}).items() if k != "phases"}
     if frame_prompts:
         if len(frame_prompts) != frames:
             raise ValueError(f"frame_prompts must have one entry per frame ({frames})")
@@ -470,12 +471,18 @@ def frame_prompt(subject: str, action: str, pose: str, index: int, frames: int, 
             "Whole body in view, plain flat light grey background, no ground, no cast shadow, no text.")
 
 
-def score(m: dict) -> float:
-    return m["iou"] - m["hist_distance"]
+def motion(m: dict) -> float:
+    """How much the silhouette changed from the previous frame (0 the same, 1 no overlap)."""
+    return round(1.0 - m["iou_prev"], 4)
 
 
-def passes(m: dict, iou_min: float, hist_max: float) -> bool:
-    return m["iou"] >= iou_min and m["hist_distance"] <= hist_max
+def passes(m: dict, iou_min: float, hist_max: float, min_motion: float = 0.0) -> bool:
+    return m["iou"] >= iou_min and m["hist_distance"] <= hist_max and motion(m) >= min_motion
+
+
+def rank(m: dict, iou_min: float, hist_max: float, min_motion: float) -> tuple:
+    """Order attempts at a frame: passing first, then closer to the base, then more motion."""
+    return (passes(m, iou_min, hist_max, min_motion), round(m["iou"] - m["hist_distance"], 4), motion(m))
 
 
 async def generate_animation(settings: Settings, sprite_or_prompt: str, action: str, *, frames: int = 6,
@@ -484,6 +491,7 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
                              shading_steps: int | None = None, saturation: float | None = None, blur: float = 0.5,
                              subject: str | None = None, frame_prompts: list[str] | None = None,
                              retries: int = 2, min_iou: float | None = None, max_hist_distance: float | None = None,
+                             min_motion: float | None = None,
                              fps: int | None = None, seed: int | None = None, name: str | None = None,
                              output_dir: str | None = None, idle_timeout_seconds: int | None = None,
                              timeout: float = 900, progress: Progress = None) -> dict:
@@ -499,6 +507,8 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
     poses, info = frame_poses(action, frames, frame_prompts)
     iou_min = info["iou_min"] if min_iou is None else float(min_iou)
     hist_max = info["hist_max"] if max_hist_distance is None else float(max_hist_distance)
+    move_min = info["min_motion"] if min_motion is None else float(min_motion)
+    limits = (iou_min, hist_max, move_min)
     seed = random.randint(0, 2**31 - 1) if seed is None else int(seed)
     outdir = out_dir(settings, output_dir)
     t0 = time.time()
@@ -530,8 +540,9 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
         res = await run_ops(settings, pixel_spec(size, shared, len(shared), pixel_style, blur, items), outs[-1])
         return res["outputs"]
 
-    async def metrics(paths: list[str]) -> list[dict]:
-        res = await run_ops(settings, {"op": "metrics", "base": base["sprite"], "frames": paths}, Path(paths[-1]))
+    async def metrics(paths: list[str], prev: str | None = None) -> list[dict]:
+        res = await run_ops(settings, {"op": "metrics", "base": base["sprite"], "frames": paths, "prev": prev},
+                            Path(paths[-1]))
         return res["frames"]
 
     # 1. Draw every frame in order: Klein edits the base reference, with the previous frame as image 2.
@@ -548,34 +559,36 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
     pix = await pixelize_frames(sources, finals)
     found = await metrics([str(f) for f in finals])
     frames_report = [{"frame": i, "seed": seed + 1 + i, "pose": poses[i], **_m(found[i]), "clipped": pix[i]["clipped"],
-                      "attempts": 1, "passed": passes(found[i], iou_min, hist_max)} for i in range(frames)]
-    # 3. Retry the frames that fall under the thresholds with new seeds; keep the best attempt.
+                      "attempts": 1, "previous_frame_reference": i > 0, "passed": passes(found[i], *limits)}
+                     for i in range(frames)]
+    # 3. Retry the frames that fall under the thresholds with new seeds; keep the best attempt. Retries
+    # leave out the previous frame: as image 2 it pins the pose, which is the usual reason a frame
+    # fails the motion check (it repeats the frame before it).
     for i in range(frames):
         for attempt in range(retries):
             if frames_report[i]["passed"]:
                 break
             s = seed + 1 + i + 1000 * (attempt + 1)
-            refs = [raws[i - 1]] if i else []
-            d = await draw(settings, [frame_prompt(what, action, poses[i], i, frames, bool(i))], [s], outdir,
-                           idle_timeout_seconds, timeout, progress, refs=refs, input_image=base["reference"])
+            d = await draw(settings, [frame_prompt(what, action, poses[i], i, frames, False)], [s], outdir,
+                           idle_timeout_seconds, timeout, progress, refs=[], input_image=base["reference"])
             [src] = await cut(settings, d["paths"], outdir, idle_timeout_seconds, timeout, progress)
             trial = outdir / f"{stem}_f{i:02d}_try{attempt + 1}.png"
             tp = (await pixelize_frames([src], [trial]))[0]
-            [m] = await metrics([str(trial)])
+            [m] = await metrics([str(trial)], prev=str(finals[i - 1]) if i else None)
             frames_report[i]["attempts"] += 1
-            if score(m) > score(frames_report[i]):
+            if rank(m, *limits) > rank(frames_report[i], *limits):
                 _move(d["paths"][0], Path(raws[i]))
                 _move(src, Path(sources[i]))
                 _move(str(trial), finals[i])
                 frames_report[i].update({"seed": s, **_m(m), "clipped": tp["clipped"],
-                                         "passed": passes(m, iou_min, hist_max)})
+                                         "previous_frame_reference": False, "passed": passes(m, *limits)})
             else:
                 for p in (d["paths"][0], src, str(trial)):
                     Path(p).unlink(missing_ok=True)
-    # 4. Neighbouring frame metrics after the retries, the strip, a GIF preview and the JSON.
+    # 4. Final metrics (a retried frame changes its neighbour's motion), the strip, a GIF and the JSON.
     final_m = await metrics([str(f) for f in finals])
     for r, m in zip(frames_report, final_m):
-        r.update({"hist_distance_prev": m["hist_distance_prev"], "iou_prev": m["iou_prev"]})
+        r.update({**_m(m), "motion": motion(m), "passed": passes(m, *limits)})
     rate = int(fps or info["fps"])
     strip = outdir / f"{stem}_strip.png"
     packed = await run_ops(settings, {"op": "pack", "images": [{"name": f"{stem}_{i:02d}", "path": str(f)}
@@ -590,7 +603,7 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
     data = {"name": stem, "action": action, "frame_count": frames, "frame_size": [size, size], "fps": rate,
             "loop": info["loop"], "strip": strip.name, "frames": [f.name for f in finals],
             "palette": shared, "base_sprite": base["sprite"], "seed": seed,
-            "thresholds": {"iou_min": iou_min, "hist_distance_max": hist_max}, "consistency": summary,
+            "thresholds": {"iou_min": iou_min, "hist_distance_max": hist_max, "min_motion": move_min}, "consistency": summary,
             "per_frame": frames_report}
     json_path = outdir / f"{stem}.json"
     json_path.write_text(json.dumps(data, indent=1))
@@ -599,7 +612,7 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
         "contact_sheet": packed["contact_sheet"], "atlas": packed["atlas"], "base_sprite": base["sprite"],
         "base_reference": base["reference"], "frame_sources": sources, "frame_raws": raws, "palette": shared,
         "action": action, "fps": rate, "loop": info["loop"], "seed": seed, "style": st,
-        "thresholds": {"iou_min": iou_min, "hist_distance_max": hist_max}, "consistency": summary,
+        "thresholds": {"iou_min": iou_min, "hist_distance_max": hist_max, "min_motion": move_min}, "consistency": summary,
         "per_frame": frames_report, "output_dir": str(outdir),
         "paths": [str(strip), str(json_path), str(gif), *map(str, finals)],
         "base": base.get("generated"), "total_seconds": round(time.time() - t0, 2),
@@ -607,7 +620,7 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
 
 
 def _m(m: dict) -> dict:
-    return {"hist_distance": m["hist_distance"], "iou": m["iou"]}
+    return {k: m[k] for k in ("hist_distance", "iou", "hist_distance_prev", "iou_prev")}
 
 
 def _summary(frames: list[dict]) -> dict:
@@ -616,6 +629,9 @@ def _summary(frames: list[dict]) -> dict:
     return {"frames_passed": sum(f["passed"] for f in frames), "frames": len(frames),
             "iou_mean": round(sum(ious) / len(ious), 4), "iou_min": min(ious),
             "hist_distance_mean": round(sum(hists) / len(hists), 4), "hist_distance_max": max(hists),
+            "motion_mean": round(sum(f["motion"] for f in frames) / len(frames), 4),
+            "motion_min": min(f["motion"] for f in frames),
+            "static_frames": sum(f["motion"] < 0.02 for f in frames),
             "retried_frames": sum(f["attempts"] > 1 for f in frames)}
 
 
