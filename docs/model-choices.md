@@ -124,14 +124,14 @@ Sources: https://huggingface.co/Comfy-Org/stable-audio-3 , https://huggingface.c
 
 ## Text to speech (added 2026-11-15)
 
-Use: dialogue for the game *A Nameless Rock: Voices in the Dark*, mainly the ship AI PATHFINDER, including "low power" lines where it struggles to speak. Criteria, in order: weights and code both licensed for commercial use, ungated (no login), runs on the CPU (the GPU is shared and usually busy with ComfyUI), good English quality, small. Voice cloning was a nice to have, not a requirement.
+Use: game dialogue, mainly a ship AI character, including "low power" lines where it struggles to speak. Criteria, in order: weights and code both licensed for commercial use, ungated (no login), runs on the CPU (the GPU is shared and usually busy with ComfyUI), good English quality, small. Voice cloning was a nice to have, not a requirement.
 
 Licences were read from each model's Hugging Face card metadata (`cardData.license`, `gated`) through the Hugging Face API on 2026-11-15, and from the project repositories. This is a reading of the stated licences, not legal advice.
 
 | Candidate | Size | Weights licence | Code licence | Notes | Decision |
 |---|---|---|---|---|---|
 | **Kokoro-82M v1.0** (hexgrad) | 82M, 327 MB | Apache 2.0, ungated | Apache 2.0 (`kokoro`, `misaki`) | StyleTTS 2 based, 54 voices (28 English), fast on a CPU, word timestamps | **Chosen** |
-| Chatterbox, Chatterbox Turbo, Multilingual (Resemble AI) | 0.5B, 350M | MIT, ungated | MIT | Zero shot voice cloning and an exaggeration control. Every output carries Resemble's PerTh neural watermark. The README says that as of August 2026 it is "retired research and is no longer maintained" | Not chosen: unmaintained, slow on a CPU, watermarked output. The upgrade path if cloning one reference voice for PATHFINDER is wanted |
+| Chatterbox, Chatterbox Turbo, Multilingual (Resemble AI) | 0.5B, 350M | MIT, ungated | MIT | Zero shot voice cloning and an exaggeration control. Every output carries Resemble's PerTh neural watermark. The README says that as of August 2026 it is "retired research and is no longer maintained" | Not chosen: unmaintained, slow on a CPU, watermarked output. The upgrade path if cloning one reference voice for a character is wanted |
 | Kitten TTS mini 0.8 / nano (KittenML) | 80M / 15M | Apache 2.0, ungated | Apache 2.0 | CPU first, a handful of voices. The project has since moved on to a larger KittenTTS 2 with voice cloning (not reviewed) | Not chosen: fewer voices; a reasonable CPU alternative (not compared by listening) |
 | Phonon 31m English (Gradium, released 2026-10-20) | 31M, 65 MB q8 GGUF | Apache 2.0, ungated (the 31m English model only; the 40m models are CC BY-NC 4.0) | runtime `ptts` | Built on Kyutai's Pocket TTS and the Mimi codec; streams, CPU friendly; no cloning in the open weights | Not chosen: a month old, new runtime. Worth a listening test later |
 | Piper (Rhasspy, now OHF-Voice `piper1-gpl`) | 15 to 60 MB per voice | per voice: each voice's model card names its dataset licence, and some datasets are non-commercial | the original MIT repo is archived; development continues as GPL-3.0 `piper1-gpl`, which links espeak-ng | Very fast, lower quality | Not chosen: each voice needs its own licence check, and quality is below Kokoro |
@@ -152,7 +152,7 @@ Licences were read from each model's Hugging Face card metadata (`cardData.licen
 | IndexTTS-2 (bilibili) | | custom licence (none in the card metadata) | | | Excluded: licence not clear |
 | OpenAudio S1 mini (Fish Audio), Higgs Audio v2 (Boson AI) | | the API refused anonymous reads (gated); Fish Audio's weights are CC BY-NC-SA | | | Excluded |
 
-Decision: **Kokoro-82M v1.0**, revision `f3ff3571791e39611d31c381e3a41a3af07b4987`, the model, `config.json` and the 28 English voices, 341.9 MB in all, pinned by SHA256 in `setup/tts.manifest`. It is the only candidate that is both clearly licensed for commercial use and ungated, small enough to run on the CPU in a few seconds per line, and mature (its packages have been stable since early 2025). The trade off is no voice cloning: PATHFINDER's voice is one of the stock voices or an average of several, and its character comes from the effects.
+Decision: **Kokoro-82M v1.0**, revision `f3ff3571791e39611d31c381e3a41a3af07b4987`, the model, `config.json` and the 28 English voices, 341.9 MB in all, pinned by SHA256 in `setup/tts.manifest`. It is the only candidate that is both clearly licensed for commercial use and ungated, small enough to run on the CPU in a few seconds per line, and mature (its packages have been stable since early 2025). The trade off is no voice cloning: a character's voice is one of the stock voices or an average of several, and its character comes from the effects.
 
 ### Dependencies of the chosen stack
 

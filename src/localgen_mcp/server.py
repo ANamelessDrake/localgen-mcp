@@ -1313,7 +1313,7 @@ async def speak(
     (flat buzzing monotone with a metallic echo); "glitch" (a voice struggling on low power: stutters
     on word onsets, dropouts, bursts of bit crushing). intensity 0 to 1 (default 0.5) scales the effect.
     seed makes the glitch pattern and noise reproducible (returned in the result either way).
-    name: file name stem for the line (for example "pathfinder_hull_40_lowpower"); an existing file
+    name: file name stem for the line (for example "ship_ai_hull_40_lowpower"); an existing file
     with that name is overwritten. Default: <voice>_<effect>_<random>.
     keep_dry: with an effect, also keep the unprocessed take as <name>_dry.wav.
     Output: 24 kHz mono 16 bit WAV, plus an OGG Vorbis copy when ffmpeg is installed, in output_dir

@@ -73,7 +73,7 @@ def test_voices_are_checked_against_the_installed_english_packs(settings):
 
 
 def test_output_names_are_sanitised():
-    assert speech.output_stem("pathfinder/../hull 40%", ["am_michael"], "glitch") == "pathfinder_.._hull_40"
+    assert speech.output_stem("ship_ai/../hull 40%", ["am_michael"], "glitch") == "ship_ai_.._hull_40"
     assert "/" not in speech.output_stem("../../x", ["am_michael"], "none")
     assert speech.output_stem(None, ["am_michael", "am_fenrir"], "radio").startswith("am_michael+am_fenrir_radio_")
     with pytest.raises(speech.TtsError):
