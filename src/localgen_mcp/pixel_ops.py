@@ -4,7 +4,7 @@
 
 Run as a child process with the MCP venv's interpreter (numpy and Pillow); the MCP server never
 imports this module, so it stays free of imaging libraries. The spec's "op" picks the operation
-(pixelize, metrics, pack, flatten); the last stdout line is "PIXEL_OPS_RESULT {json}".
+(pixelize, metrics, pack, flatten, animate, pose_guides); the last stdout line is "PIXEL_OPS_RESULT {json}".
 The file imports nothing from the package, so it runs by path with -I (no script folder or
 current folder on sys.path). The tests import its functions directly.
 
@@ -677,7 +677,7 @@ def op_flatten(spec: dict) -> dict:
 
 
 def op_animate(spec: dict) -> dict:
-    """spec: frames [paths], output (.gif), fps, zoom, background (#rrggbb), loop: a looping GIF
+    """spec: frames [paths], output (.gif), fps or durations [ms per frame], zoom, background (#rrggbb), loop: a looping GIF
     preview of an animation, each frame scaled up by zoom and flattened on the background (GIF has
     no partial transparency)."""
     bg = hex_colour(spec.get("background", "#8a8a90")) + (255,)
@@ -690,13 +690,341 @@ def op_animate(spec: dict) -> dict:
         flat.alpha_composite(im)
         frames.append(flat.convert("RGB"))
     duration = max(20, round(1000 / float(spec.get("fps", 8))))
+    if spec.get("durations"):  # per frame display times in ms (pose clips time their key frames)
+        if len(spec["durations"]) != len(frames):
+            raise ValueError("give one duration per frame")
+        duration = [max(20, int(d)) for d in spec["durations"]]
     frames[0].save(spec["output"], save_all=True, append_images=frames[1:], duration=duration,
                    loop=0 if spec.get("loop", True) else 1, disposal=1)
     return {"path": spec["output"], "frames": len(frames), "duration_ms": duration}
 
 
+# -- pose guides -------------------------------------------------------------
+#
+# A pose guide is a plain figure in one pose of a baked clip (pose_math.py), drawn at the size of
+# the image it will be paired with, so a diffusion edit can copy the pose. pose_math does the
+# retargeting and the camera; this part only draws.
+
+_POSE_MATH = None
+CLIP_MAX_BYTES = 64 << 20
+GUIDE_STYLES = ("capsule", "skeleton")
+WEAPONS = ("dagger", "sword", "axe", "warhammer", "spear", "shield")
+GUIDE_BACKGROUND = {"capsule": (216, 216, 216), "skeleton": (0, 0, 0)}
+SUPERSAMPLE = 2
+# Capsule radius of the segment ending at each joint, as a share of stature (times body thickness).
+SEGMENT_RADIUS = {"spine": 0.07, "chest": 0.08, "neck": 0.03, "head": 0.03, "shoulder_l": 0.03, "shoulder_r": 0.03,
+                  "elbow_l": 0.033, "elbow_r": 0.033, "wrist_l": 0.027, "wrist_r": 0.027, "hand_l": 0.025,
+                  "hand_r": 0.025, "hip_l": 0.048, "hip_r": 0.048, "knee_l": 0.048, "knee_r": 0.048,
+                  "ankle_l": 0.036, "ankle_r": 0.036, "toe_l": 0.026, "toe_r": 0.026}
+HEAD_RADIUS = 0.55            # head disc radius as a share of the head joint to crown length
+GUIDE_COLOURS = {"torso": (180, 180, 188), "head": (206, 200, 194), "l": (118, 148, 206), "r": (206, 138, 108),
+                 "face": (60, 60, 72), "blade": (232, 234, 240), "haft": (122, 96, 70), "shield": (156, 124, 84)}
+DEPTH_SHADE = 0.6             # the farthest part is drawn at this share of its colour, the nearest at 1
+# OpenPose body colours and limbs (COCO 18 order), so the skeleton style reads as an OpenPose map.
+OPENPOSE_COLOURS = [(255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0), (170, 255, 0), (85, 255, 0),
+                    (0, 255, 0), (0, 255, 85), (0, 255, 170), (0, 255, 255), (0, 170, 255), (0, 85, 255),
+                    (0, 0, 255), (85, 0, 255), (170, 0, 255), (255, 0, 255), (255, 0, 170), (255, 0, 85)]
+OPENPOSE_LIMBS = [("neck_mid", "shoulder_r"), ("neck_mid", "shoulder_l"), ("shoulder_r", "elbow_r"),
+                  ("elbow_r", "wrist_r"), ("shoulder_l", "elbow_l"), ("elbow_l", "wrist_l"), ("neck_mid", "hip_r"),
+                  ("hip_r", "knee_r"), ("knee_r", "ankle_r"), ("neck_mid", "hip_l"), ("hip_l", "knee_l"),
+                  ("knee_l", "ankle_l"), ("neck_mid", "face"), ("ankle_r", "toe_r"), ("ankle_l", "toe_l"),
+                  ("wrist_r", "hand_r"), ("wrist_l", "hand_l")]
+# Prop sizes in metres for a 1.75 m figure (scaled with the figure's stature).
+PROP_REFERENCE_STATURE = 1.75
+
+
+def pose_math():
+    """pose_math.py, loaded by path from this file's folder (this helper imports nothing from the package)."""
+    global _POSE_MATH
+    if _POSE_MATH is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("pose_math", Path(__file__).with_name("pose_math.py"))
+        _POSE_MATH = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_POSE_MATH)
+    return _POSE_MATH
+
+
+def load_clip(path) -> dict:
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError("pose clip file not found")
+    if p.stat().st_size > CLIP_MAX_BYTES:
+        raise ValueError("pose clip file too large")
+    try:
+        clip = json.loads(p.read_bytes().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("pose clip file is not JSON") from None
+    pose_math().check_clip(clip)
+    return clip
+
+
+def weapon_list(weapon) -> list[str]:
+    if weapon in (None, "", "none"):
+        return []
+    items = [weapon] if isinstance(weapon, str) else list(weapon)
+    for w in items:
+        if w not in WEAPONS:
+            raise ValueError(f"weapon must be one of {list(WEAPONS)} (or a list such as ['sword', 'shield'])")
+    if len(items) > 2 or len(set(items)) != len(items) or (len(items) == 2 and "shield" not in items):
+        raise ValueError("give one weapon, or one weapon and a shield")
+    return items
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-9)
+
+
+def prop_parts(kind: str, pos: np.ndarray, world: np.ndarray, rest_grip: dict, hand: str, size: float) -> list:
+    """3D parts of one prop held in `hand` for one frame: ("capsule", [p0, p1], radius) or
+    ("poly", [points]); lengths in metres times size. The grip runs along the hand's thumb side:
+    the rest pose's forward direction carried by the hand segment's rotation."""
+    pm = pose_math()
+    J = pm.INDEX
+    s = hand[0]
+    h, w = pos[J[f"hand_{s}"]], pos[J[f"wrist_{s}"]]
+    g = _unit(pm.qrot(world[J[f"hand_{s}"]], rest_grip[s]))
+    k = _unit(h - w)                 # knuckle direction, across the grip
+    grip = (h + w) / 2 + 0.35 * (h - w)
+    if kind == "dagger":
+        return [("capsule", [grip - 0.05 * size * g, grip + 0.3 * size * g], 0.016 * size),
+                ("capsule", [grip - 0.05 * size * k, grip + 0.05 * size * k], 0.012 * size)]
+    if kind == "sword":
+        return [("capsule", [grip - 0.1 * size * g, grip + 0.85 * size * g], 0.02 * size),
+                ("capsule", [grip + 0.06 * size * g - 0.1 * size * k, grip + 0.06 * size * g + 0.1 * size * k],
+                 0.014 * size)]
+    if kind == "axe":
+        tip = grip + 0.62 * size * g
+        head = [tip + 0.05 * size * g, tip + 0.06 * size * g + 0.17 * size * k,
+                tip - 0.16 * size * g + 0.17 * size * k, tip - 0.1 * size * g]
+        return [("capsule", [grip - 0.15 * size * g, tip + 0.05 * size * g], 0.017 * size), ("poly", head)]
+    if kind == "warhammer":
+        tip = grip + 0.62 * size * g
+        return [("capsule", [grip - 0.12 * size * g, tip], 0.017 * size),
+                ("capsule", [tip - 0.11 * size * k, tip + 0.11 * size * k], 0.05 * size)]
+    if kind == "spear":
+        tip = grip + 1.25 * size * g
+        return [("capsule", [grip - 0.7 * size * g, tip], 0.014 * size),
+                ("poly", [tip + 0.22 * size * g, tip + 0.045 * size * k, tip - 0.045 * size * k])]
+    # shield: a disc across the forearm, facing away from the body
+    e = pos[J[f"elbow_{s}"]]
+    fore = _unit(w - e)
+    n = _unit(np.cross(fore, g))
+    if np.dot(n, w - pos[J["chest"]]) < 0:
+        n = -n
+    a = _unit(np.cross(n, fore))
+    b = fore
+    centre = (e + w) / 2 + 0.06 * size * n
+    ang = np.linspace(0, 2 * np.pi, 28, endpoint=False)
+    return [("poly", [centre + 0.28 * size * (math.cos(t) * a + math.sin(t) * b) for t in ang])]
+
+
+def _shade(colour, near: float) -> tuple:
+    f = DEPTH_SHADE + (1.0 - DEPTH_SHADE) * float(np.clip(near, 0.0, 1.0))
+    return tuple(int(round(c * f)) for c in colour)
+
+
+def guide_primitives(pos: np.ndarray, world: np.ndarray, *, style: str, stature: float, thickness: float,
+                     weapons: list[str], weapon_hand: str, rest_grip: dict) -> list[dict]:
+    """The figure for one frame as 3D primitives {kind, points, radius, colour, depth_points, order}."""
+    pm = pose_math()
+    J = pm.INDEX
+    prims = []
+    off_hand = "left" if weapon_hand == "right" else "right"
+    size = stature / PROP_REFERENCE_STATURE
+    for i, w in enumerate(weapons):
+        hand = off_hand if (w == "shield" and len(weapons) == 2) else weapon_hand
+        colour = GUIDE_COLOURS["shield" if w == "shield" else "blade"]
+        for j, (kind, pts, *r) in enumerate(prop_parts(w, pos, world, rest_grip, hand, size)):
+            c = GUIDE_COLOURS["haft"] if (kind == "capsule" and w in ("axe", "warhammer", "spear") and j == 0) else colour
+            prims.append({"kind": kind, "points": np.array(pts), "radius": r[0] if r else 0.0, "colour": c,
+                          "order": 50 + i})
+    if style == "skeleton":
+        pts = {n: pos[J[n]] for n in pm.NAMES}
+        pts["neck_mid"] = (pos[J["shoulder_l"]] + pos[J["shoulder_r"]]) / 2
+        for i, (a, b) in enumerate(OPENPOSE_LIMBS):
+            prims.append({"kind": "line", "points": np.array([pts[a], pts[b]]), "radius": 0.012 * stature,
+                          "colour": OPENPOSE_COLOURS[i % len(OPENPOSE_COLOURS)], "order": 10, "flat": True})
+        dots = ["face", "neck_mid", "shoulder_r", "elbow_r", "wrist_r", "shoulder_l", "elbow_l", "wrist_l", "hip_r",
+                "knee_r", "ankle_r", "hip_l", "knee_l", "ankle_l"]
+        for i, n in enumerate(dots):
+            prims.append({"kind": "disc", "points": np.array([pts[n]]), "radius": 0.016 * stature,
+                          "colour": OPENPOSE_COLOURS[i], "order": 20, "flat": True})
+        return prims
+    for j, p in enumerate(pm.PARENTS):
+        name = pm.NAMES[j]
+        if p < 0 or name in pm.SYNTHETIC:
+            continue
+        side = name[-1] if name[-2:] in ("_l", "_r") else None
+        colour = GUIDE_COLOURS[side] if side else GUIDE_COLOURS["torso"]
+        prims.append({"kind": "capsule", "points": np.array([pos[p], pos[j]]),
+                      "radius": SEGMENT_RADIUS[name] * stature * thickness, "colour": colour, "order": 0})
+    quad = [pos[J[n]] for n in ("shoulder_l", "shoulder_r", "hip_r", "hip_l")]
+    prims.append({"kind": "poly", "points": np.array(quad), "radius": 0.0, "colour": GUIDE_COLOURS["torso"],
+                  "order": -1})
+    head, top = pos[J["head"]], pos[J["head_top"]]
+    hr = HEAD_RADIUS * float(np.linalg.norm(top - head))
+    centre = (head + top) / 2
+    prims.append({"kind": "disc", "points": np.array([centre]), "radius": hr, "colour": GUIDE_COLOURS["head"],
+                  "order": 1})
+    # The nose: a dot on the head towards the face, drawn over the head only when it faces the camera.
+    face = centre + 0.85 * hr * _unit(pos[J["face"]] - centre)
+    prims.append({"kind": "disc", "points": np.array([face]), "radius": 0.22 * hr, "colour": GUIDE_COLOURS["face"],
+                  "order": 2})
+    return prims
+
+
+def draw_guide(prims: list[dict], cam: np.ndarray, scale: float, origin, size: tuple[int, int], background) -> Image.Image:
+    """Project and draw primitives far to near (depth order), each shaded by its depth."""
+    pm = pose_math()
+    ss = SUPERSAMPLE
+    im = Image.new("RGB", (size[0] * ss, size[1] * ss), tuple(background))
+    draw = ImageDraw.Draw(im)
+    placed = []
+    for p in prims:
+        proj = pm.project(p["points"], cam, scale * ss, (origin[0] * ss, origin[1] * ss))
+        placed.append((float(proj[:, 2].mean()), p["order"], proj, p))
+    depths = [d for d, *_ in placed]
+    lo, hi = min(depths), max(depths)
+    for depth, _, proj, p in sorted(placed, key=lambda t: (t[0], t[1])):
+        near = (depth - lo) / (hi - lo) if hi - lo > 1e-9 else 1.0
+        colour = tuple(p["colour"]) if p.get("flat") else _shade(p["colour"], near)
+        r = p["radius"] * scale * ss
+        xy = [(float(x), float(y)) for x, y in proj[:, :2]]
+        if p["kind"] in ("capsule", "line"):
+            draw.line(xy, fill=colour, width=max(1, int(round(2 * r))))
+            if p["kind"] == "capsule":
+                for x, y in xy:
+                    draw.ellipse([x - r, y - r, x + r, y + r], fill=colour)
+        elif p["kind"] == "disc":
+            x, y = xy[0]
+            draw.ellipse([x - r, y - r, x + r, y + r], fill=colour)
+        elif p["kind"] == "poly":
+            draw.polygon(xy, fill=colour)
+    return im.resize(size, Image.LANCZOS)
+
+
+def _extent(prims_frames: list[list[dict]], cam: np.ndarray) -> tuple[float, float, float, float]:
+    """Camera plane bounds (right min, right max, up min, up max) of every primitive, radius included."""
+    lo, hi = np.full(2, np.inf), np.full(2, -np.inf)
+    for prims in prims_frames:
+        for p in prims:
+            q = p["points"] @ cam[:2].T
+            lo = np.minimum(lo, q.min(0) - p["radius"])
+            hi = np.maximum(hi, q.max(0) + p["radius"])
+    return float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1])
+
+
+def fit_shrink(extent, scale: float, origin, width: int, height: int, margin: float) -> float:
+    """The factor (at most 1) to shrink the scale by, about the origin, so the camera plane extent
+    (right min, right max, up min, up max) stays margin pixels inside the canvas."""
+    rx0, rx1, uy0, uy1 = extent
+    # pixel x = ox + r * scale, pixel y = oy - u * scale: how far each side reaches from the origin,
+    # and the room there.
+    sides = [(-rx0, origin[0] - margin), (rx1, width - margin - origin[0]),
+             (uy1, origin[1] - margin), (-uy0, height - margin - origin[1])]
+    shrink = 1.0
+    for reach, room in sides:
+        if reach > 0 and reach * scale > room:
+            shrink = min(shrink, max(room, 1e-6) / (reach * scale))
+    return shrink
+
+
+def op_pose_guides(spec: dict) -> dict:
+    """spec: clip (path), frames (n) or clip_frames [indices], selection ("auto", "even", "keys"),
+    body (preset or dict), view, elevation, style ("capsule" or "skeleton"), weapon (name or [name,
+    "shield"]), weapon_hand (default the clip's), exaggerate, size [w, h] or match_image (a cut-out
+    whose size and subject box the figure takes: feet on the box bottom, centred, as tall as the
+    box), outputs [paths], contact (optional path for a review sheet).
+
+    One scale for every frame: the clip's first frame stands as tall as the box (or 80% of the
+    canvas), feet on the floor line; if any selected frame would leave the canvas, the scale
+    shrinks for all frames and "shrink" reports by how much."""
+    pm = pose_math()
+    clip = load_clip(spec["clip"])
+    meta = clip.get("metadata") or {}
+    style = spec.get("style", "capsule")
+    if style not in GUIDE_STYLES:
+        raise ValueError(f"guide style must be one of {list(GUIDE_STYLES)}")
+    weapons = weapon_list(spec.get("weapon"))
+    weapon_hand = spec.get("weapon_hand") or meta.get("weapon_hand") or "right"
+    if weapon_hand not in ("left", "right"):
+        raise ValueError('weapon_hand must be "left" or "right"')
+    cam = pm.camera(spec.get("view", "front"), spec.get("elevation", 0.0))
+    rt = pm.retarget(clip, spec.get("body"), float(spec.get("exaggerate", 1.0)))
+    frame_count = int(clip["frame_count"])
+    if spec.get("clip_frames") is not None:
+        chosen = [int(f) for f in spec["clip_frames"]]
+        if not chosen or any(not 0 <= f < frame_count for f in chosen):
+            raise ValueError(f"clip_frames must be indices from 0 to {frame_count - 1}")
+        impact = meta.get("impact_frame")
+        sel = {"frames": chosen, "labels": [""] * len(chosen),
+               "impact_index": chosen.index(impact) if impact in chosen else None}
+    else:
+        sel = pm.select_frames(meta, frame_count, int(spec["frames"]), spec.get("selection", "auto"))
+    if spec.get("validate_only"):
+        return {"clip": clip.get("name"), "clip_frames": sel["frames"], "impact_index": sel["impact_index"],
+                "action": meta.get("action"), "loop": bool(meta.get("loop")), "weapons": weapons}
+    outputs = spec["outputs"]
+    if len(outputs) != len(sel["frames"]):
+        raise ValueError("give one output path per frame")
+    offsets = rt["offsets"]
+    rest_grip = {}
+    for s in "lr":
+        axis = _unit(offsets[pm.INDEX[f"hand_{s}"]])
+        fwd = np.array([0.0, -1.0, 0.0])
+        rest_grip[s] = _unit(fwd - np.dot(fwd, axis) * axis)
+    thickness = rt["body"]["thickness"]
+    common = dict(style=style, stature=rt["stature"], thickness=thickness, weapons=weapons,
+                  weapon_hand=weapon_hand, rest_grip=rest_grip)
+    frames = [guide_primitives(rt["positions"][f], rt["world"][f], **common) for f in sel["frames"]]
+    first = guide_primitives(rt["positions"][0], rt["world"][0], **{**common, "weapons": []})
+    background = GUIDE_BACKGROUND[style]
+    if spec.get("match_image"):
+        ref = load_rgba(spec["match_image"])
+        width, height = ref.shape[1], ref.shape[0]
+        box = subject_box(ref[..., 3]) if ref.shape[2] == 4 else None
+        if box is None or (box[2] - box[0]) * (box[3] - box[1]) >= 0.98 * width * height:
+            box = (int(0.1 * width), int(0.1 * height), int(0.9 * width), int(0.9 * height))
+    else:
+        width, height = (int(v) for v in spec.get("size") or (1024, 1024))
+        box = (int(0.1 * width), int(0.1 * height), int(0.9 * width), int(0.9 * height))
+    if not (16 <= width <= 4096 and 16 <= height <= 4096):
+        raise ValueError("guide size must be 16 to 4096 pixels a side")
+    x0, y0, x1, y1 = box
+    fx0, fx1, fy0, fy1 = _extent([first], cam)
+    scale = (y1 - y0) / max(fy1 - fy0, 1e-6)
+    # The first frame centred on the box, its lowest point on the box bottom.
+    origin = [(x0 + x1) / 2 - (fx0 + fx1) / 2 * scale, y1 + fy0 * scale]
+    shrink = fit_shrink(_extent(frames, cam), scale, origin, width, height, 0.02 * min(width, height))
+    scale *= shrink
+    paths = []
+    for prims, out in zip(frames, outputs):
+        draw_guide(prims, cam, scale, origin, (width, height), background).save(out)
+        paths.append(str(out))
+    fps = float(clip["fps"])
+    usable = frame_count - 1 if meta.get("last_frame_repeats_first") else frame_count
+    picked = sel["frames"]
+    steps = [(picked[i + 1] - picked[i]) for i in range(len(picked) - 1)]
+    if meta.get("loop"):
+        steps.append(usable - picked[-1] + picked[0])
+    else:
+        steps.append(round(sum(steps) / len(steps)) if steps else 1)
+    durations = [max(20, int(round(1000 * max(s, 1) / fps))) for s in steps]
+    if spec.get("contact"):
+        thumbs = [np.asarray(Image.open(p).convert("RGBA").resize((256, int(256 * height / width)), Image.LANCZOS))
+                  for p in paths]
+        names = [f"f{i:02d} c{f}" + (" impact" if i == sel["impact_index"] else (f" {lab}" if lab else ""))
+                 for i, (f, lab) in enumerate(zip(picked, sel["labels"]))]
+        contact_sheet(thumbs, names, 256, thumbs[0].shape[0], spec["contact"], min(len(thumbs), 8))
+    return {"paths": paths, "clip": clip.get("name"), "clip_frames": picked, "labels": sel["labels"],
+            "impact_index": sel["impact_index"], "durations_ms": durations, "fps": fps,
+            "loop": bool(meta.get("loop")), "action": meta.get("action"), "weapon_hand": weapon_hand,
+            "weapons": weapons, "body": rt["body"], "scale": round(scale, 3), "shrink": round(shrink, 4),
+            "size": [width, height], "box": list(box), "contact": spec.get("contact")}
+
+
 OPS = {"pixelize": op_pixelize, "metrics": op_metrics, "pack": op_pack, "flatten": op_flatten,
-       "animate": op_animate}
+       "animate": op_animate, "pose_guides": op_pose_guides}
 
 
 def main(argv: list[str]) -> int:

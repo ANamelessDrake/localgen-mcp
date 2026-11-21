@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import blender_run, cutout, jobs, workflows
+from . import poses as poses_lib
 from .config import Settings
 from .workflows.image_edit import edit_images
 
@@ -471,6 +472,28 @@ def frame_prompt(subject: str, action: str, pose: str, index: int, frames: int, 
             "Whole body in view, plain flat light grey background, no ground, no cast shadow, no text.")
 
 
+# Pose guided frames: image 2 is a plain figure in the pose (pixel_ops.op_pose_guides).
+GUIDE_WORDS = {
+    "capsule": "a plain grey mannequin (its blue limbs are its left side, its orange limbs its right side)",
+    "skeleton": "an OpenPose style stick skeleton on black",
+}
+# Which preset's thresholds and frame rate a clip's action tag takes when `action` is not a preset.
+CLIP_ACTIONS = {"walk": "walk", "run": "walk", "idle": "idle", "attack": "attack", "chop": "chop",
+                "hammer": "chop", "hurt": "hurt", "die": "die"}
+
+
+def pose_frame_prompt(subject: str, action: str, index: int, frames: int, style: str, prop: bool) -> str:
+    held = (" The pale shapes in its hand only mark where the character's own weapon or tool is held." if prop
+            else "")
+    return (f"Image 1 shows {subject}. Image 2 is a pose reference: {GUIDE_WORDS[style]}.{held} Draw exactly "
+            "the same character as image 1, with the same design, proportions, colours, clothing and equipment, "
+            "in the exact pose of the figure in image 2: the same body lean, head direction, arm and leg "
+            "positions, seen from the same camera angle as image 2. Keep the character's own look; do not "
+            f"draw the reference figure or its colours. This is frame {index + 1} of {frames} of a {action} "
+            "animation for a 2D game. Whole body in view, plain flat light grey background, no ground, no cast "
+            "shadow, no text.")
+
+
 def motion(m: dict) -> float:
     """How much the silhouette changed from the previous frame (0 the same, 1 no overlap)."""
     return round(1.0 - m["iou_prev"], 4)
@@ -494,7 +517,10 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
                              min_motion: float | None = None,
                              fps: int | None = None, seed: int | None = None, name: str | None = None,
                              output_dir: str | None = None, idle_timeout_seconds: int | None = None,
-                             timeout: float = 900, progress: Progress = None) -> dict:
+                             timeout: float = 900, progress: Progress = None, pose_clip: str | None = None,
+                             body: str | dict | None = None, view: str | float = "front", elevation: float = 15.0,
+                             guide_style: str = "capsule", weapon: str | list[str] | None = None,
+                             exaggerate: float = 1.0, frame_selection: str = "auto") -> dict:
     if not 2 <= frames <= 16:
         raise ValueError("frames must be between 2 and 16")
     if not 0 <= retries <= 5:
@@ -504,7 +530,22 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
     check_pixel_options(size=size, max_colors=max_colors, blur=blur)
     st = resolve_style(style, outline, outline_color, shading_steps, saturation)
     pal = resolve_palette(settings, palette)
+    if pose_clip and frame_prompts:
+        raise ValueError("give pose_clip or frame_prompts, not both")
     poses, info = frame_poses(action, frames, frame_prompts)
+    pose_spec = None
+    if pose_clip:
+        clip_path, clip_label = poses_lib.resolve_clip(settings, pose_clip)
+        pose_spec = {"op": "pose_guides", "clip": str(clip_path), "frames": frames, "selection": frame_selection,
+                     "body": body, "view": view, "elevation": elevation, "style": guide_style, "weapon": weapon,
+                     "exaggerate": exaggerate}
+        # Checked before any drawing, so a bad view, body or weapon fails before the GPU work.
+        checked = await run_ops(settings, {**pose_spec, "validate_only": True}, clip_path)
+        if action.lower().strip() not in ACTIONS and checked.get("action") in CLIP_ACTIONS:
+            preset = ACTIONS[CLIP_ACTIONS[checked["action"]]]
+            info = {k: v for k, v in preset.items() if k != "phases"}
+        info["loop"] = checked["loop"]
+        poses = [f"clip {clip_label} frame {f}" for f in checked["clip_frames"]]
     iou_min = info["iou_min"] if min_iou is None else float(min_iou)
     hist_max = info["hist_max"] if max_hist_distance is None else float(max_hist_distance)
     move_min = info["min_motion"] if min_motion is None else float(min_motion)
@@ -540,16 +581,34 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
         res = await run_ops(settings, pixel_spec(size, shared, len(shared), pixel_style, blur, items), outs[-1])
         return res["outputs"]
 
+    guides: list[str] = []
+    pose_report: dict | None = None
+    if pose_spec:
+        outs = [outdir / f"{stem}_f{i:02d}_guide.png" for i in range(frames)]
+        pose_report = await run_ops(settings, {**pose_spec, "match_image": base["source"],
+                                               "outputs": [str(o) for o in outs],
+                                               "contact": str(outdir / f"{stem}_guides.png")}, outs[-1])
+        guides = pose_report["paths"]
+
+    def frame_text(i: int, has_prev: bool) -> str:
+        if guides:
+            return pose_frame_prompt(what, action, i, frames, guide_style, bool(pose_report["weapons"]))
+        return frame_prompt(what, action, poses[i], i, frames, has_prev)
+
+    def frame_refs(i: int, prev: list[str]) -> list[str]:
+        return [guides[i]] if guides else prev
+
     async def metrics(paths: list[str], prev: str | None = None) -> list[dict]:
         res = await run_ops(settings, {"op": "metrics", "base": base["sprite"], "frames": paths, "prev": prev},
                             Path(paths[-1]))
         return res["frames"]
 
-    # 1. Draw every frame in order: Klein edits the base reference, with the previous frame as image 2.
+    # 1. Draw every frame in order: Klein edits the base reference, with the previous frame as image 2
+    # (with a pose clip, the frame's pose guide is image 2 instead).
     raws: list[str] = []
-    for i, pose in enumerate(poses):
-        refs = [raws[-1]] if raws else []
-        d = await draw(settings, [frame_prompt(what, action, pose, i, frames, bool(raws))], [seed + 1 + i], outdir,
+    for i in range(frames):
+        refs = frame_refs(i, [raws[-1]] if raws else [])
+        d = await draw(settings, [frame_text(i, bool(raws))], [seed + 1 + i], outdir,
                        idle_timeout_seconds, timeout, progress, refs=refs, input_image=base["reference"])
         raws.append(_move(d["paths"][0], outdir / f"{stem}_f{i:02d}_raw.png"))
     # 2. Cut out, pixelize with the shared palette and the base's scale, measure.
@@ -559,8 +618,12 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
     pix = await pixelize_frames(sources, finals)
     found = await metrics([str(f) for f in finals])
     frames_report = [{"frame": i, "seed": seed + 1 + i, "pose": poses[i], **_m(found[i]), "clipped": pix[i]["clipped"],
-                      "attempts": 1, "previous_frame_reference": i > 0, "passed": passes(found[i], *limits)}
+                      "attempts": 1, "previous_frame_reference": i > 0 and not guides,
+                      "passed": passes(found[i], *limits)}
                      for i in range(frames)]
+    for i, r in enumerate(frames_report if guides else []):
+        r.update(pose_guide=guides[i], clip_frame=pose_report["clip_frames"][i],
+                 key_label=pose_report["labels"][i] or None)
     # 3. Retry the frames that fall under the thresholds with new seeds; keep the best attempt. Retries
     # leave out the previous frame: as image 2 it pins the pose, which is the usual reason a frame
     # fails the motion check (it repeats the frame before it).
@@ -569,8 +632,8 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
             if frames_report[i]["passed"]:
                 break
             s = seed + 1 + i + 1000 * (attempt + 1)
-            d = await draw(settings, [frame_prompt(what, action, poses[i], i, frames, False)], [s], outdir,
-                           idle_timeout_seconds, timeout, progress, refs=[], input_image=base["reference"])
+            d = await draw(settings, [frame_text(i, False)], [s], outdir, idle_timeout_seconds, timeout,
+                           progress, refs=frame_refs(i, []), input_image=base["reference"])
             [src] = await cut(settings, d["paths"], outdir, idle_timeout_seconds, timeout, progress)
             trial = outdir / f"{stem}_f{i:02d}_try{attempt + 1}.png"
             tp = (await pixelize_frames([src], [trial]))[0]
@@ -589,7 +652,13 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
     final_m = await metrics([str(f) for f in finals])
     for r, m in zip(frames_report, final_m):
         r.update({**_m(m), "motion": motion(m), "passed": passes(m, *limits)})
-    rate = int(fps or info["fps"])
+    durations = pose_report["durations_ms"] if pose_report and not fps else None
+    if fps:
+        rate = int(fps)
+    elif durations:
+        rate = max(1, min(60, round(1000 * len(durations) / sum(durations))))
+    else:
+        rate = int(info["fps"])
     strip = outdir / f"{stem}_strip.png"
     packed = await run_ops(settings, {"op": "pack", "images": [{"name": f"{stem}_{i:02d}", "path": str(f)}
                                                               for i, f in enumerate(finals)],
@@ -598,13 +667,23 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
                                       "contact": str(outdir / f"{stem}_contact.png")}, strip)
     gif = outdir / f"{stem}_preview.gif"
     await run_ops(settings, {"op": "animate", "frames": [str(f) for f in finals], "output": str(gif), "fps": rate,
-                             "zoom": max(1, 256 // size), "loop": info["loop"]}, gif)
+                             "durations": durations, "zoom": max(1, 256 // size), "loop": info["loop"]}, gif)
+    impact, pose_data = None, None
+    if pose_report:
+        impact = pose_report["impact_index"]
+        pose_data = {"clip": pose_report["clip"], "clip_file": pose_spec["clip"], "action": pose_report["action"],
+                     "body": pose_report["body"], "view": view, "elevation": elevation, "style": guide_style,
+                     "weapons": pose_report["weapons"], "weapon_hand": pose_report["weapon_hand"],
+                     "exaggerate": exaggerate, "selection": frame_selection,
+                     "clip_frames": pose_report["clip_frames"], "labels": pose_report["labels"],
+                     "durations_ms": durations, "guides": guides, "guide_sheet": pose_report["contact"],
+                     "guide_shrink": pose_report["shrink"]}
     summary = _summary(frames_report)
     data = {"name": stem, "action": action, "frame_count": frames, "frame_size": [size, size], "fps": rate,
             "loop": info["loop"], "strip": strip.name, "frames": [f.name for f in finals],
             "palette": shared, "base_sprite": base["sprite"], "seed": seed,
             "thresholds": {"iou_min": iou_min, "hist_distance_max": hist_max, "min_motion": move_min}, "consistency": summary,
-            "per_frame": frames_report}
+            "impact_frame": impact, "durations_ms": durations, "pose": pose_data, "per_frame": frames_report}
     json_path = outdir / f"{stem}.json"
     json_path.write_text(json.dumps(data, indent=1))
     return {
@@ -613,7 +692,7 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
         "base_reference": base["reference"], "frame_sources": sources, "frame_raws": raws, "palette": shared,
         "action": action, "fps": rate, "loop": info["loop"], "seed": seed, "style": st,
         "thresholds": {"iou_min": iou_min, "hist_distance_max": hist_max, "min_motion": move_min}, "consistency": summary,
-        "per_frame": frames_report, "output_dir": str(outdir),
+        "per_frame": frames_report, "impact_frame": impact, "pose": pose_data, "output_dir": str(outdir),
         "paths": [str(strip), str(json_path), str(gif), *map(str, finals)],
         "base": base.get("generated"), "total_seconds": round(time.time() - t0, 2),
     }

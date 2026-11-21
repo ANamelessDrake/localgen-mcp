@@ -47,6 +47,12 @@ class Settings:
     blender: str | None = None  # None: find "blender" on PATH
     blender_threads: int = 8
     retopo_timeout: int = 1800
+    pose_dir: Path | None = None  # baked pose clip library; None: <root>/data/localgen/poses
+
+    @property
+    def pose_library(self) -> Path:
+        """Where bake_pose_library writes pose clips and their index.json (outside the repository)."""
+        return self.pose_dir or self.root / "data" / "localgen" / "poses"
 
     @property
     def base_url(self) -> str:
@@ -118,4 +124,5 @@ def load() -> Settings:
         blender=os.environ.get("LOCALGEN_BLENDER") or None,
         blender_threads=max(1, _env_int("LOCALGEN_BLENDER_THREADS", 8)),
         retopo_timeout=_env_int("LOCALGEN_TIMEOUT_RETOPO", 1800),
+        pose_dir=_env_path("LOCALGEN_POSE_DIR", root / "data" / "localgen" / "poses"),
     )
