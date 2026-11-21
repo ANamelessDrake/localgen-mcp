@@ -163,7 +163,7 @@ fi
 # -- MCP server venv -------------------------------------------------------
 
 step "MCP server venv ($MCP_VENV)"
-if [[ -x "$MCP_VENV/bin/python" ]] && "$MCP_VENV/bin/python" -c "import localgen_mcp, mcp" 2>/dev/null; then
+if [[ -x "$MCP_VENV/bin/python" ]] && "$MCP_VENV/bin/python" -c "import localgen_mcp, mcp, numpy, PIL" 2>/dev/null; then
     say "  ok: venv exists and imports localgen_mcp from $("$MCP_VENV/bin/python" -c 'import localgen_mcp, os; print(os.path.dirname(localgen_mcp.__file__))')"
 else
     [[ -x "$MCP_VENV/bin/python" ]] || run uv venv --python "$PYTHON_VERSION" "$MCP_VENV"
