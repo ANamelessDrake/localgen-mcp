@@ -45,6 +45,9 @@ def sheet(path: Path, layout: list[list[tuple[int, int]]], width: int = 1200, he
                 d.paste((170, 170, 170, 255), (x + 20, feet - 2, x + FIG - 20, feet + 5))
                 canvas.alpha_composite(d)
             canvas.alpha_composite(fig, (x, y))
+            # A raised tool at head height, longer frame by frame, attached to the body: it moves the
+            # frame's box and centre of mass but not its torso, so only a torso anchor stays put.
+            canvas.paste((70, 70, 80, 255), (x + 100, y + 35, x + 106 + 12 * (i % 4), y + 45))
             i += 1
     if extra:
         extra(canvas)
@@ -97,8 +100,9 @@ def test_grid_is_read_left_to_right_then_top_to_bottom(tmp_path):
     res = run(tmp_path, src, frames=7, rows=2, columns=4)
     assert res["count_ok"] and res["per_row"] == [4, 3] and res["rows_found"] == 2
     assert [f["row"] for f in res["frames"]] == [0, 0, 0, 0, 1, 1, 1]
-    widths = [f["sheet_box"][2] - f["sheet_box"][0] for f in res["frames"]]
-    assert widths == sorted(widths)            # stride grows with the frame index, so order is kept
+    lefts = [f["sheet_box"][0] for f in res["frames"]]
+    assert lefts[:4] == sorted(lefts[:4]) and lefts[4:] == sorted(lefts[4:])
+    assert res["frames"][4]["sheet_box"][1] > res["frames"][3]["sheet_box"][3]   # row 2 starts below row 1
     check_aligned(res)
 
 
