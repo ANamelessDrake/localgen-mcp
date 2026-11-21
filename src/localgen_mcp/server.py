@@ -1055,8 +1055,8 @@ async def bake_pose_library(
     Metadata per clip: action tag (from `action` or the file name: walk, run, idle, attack, chop,
     hammer, hurt, die, block, jump), loop (from `loop`, or "loop" in the name, or a looping action),
     weapon hand (`weapon_hand`, an _L/_R in the name, or the hand that moves most), and key frames
-    detected from the motion: for strikes wind-up, impact (the weapon hand's most extended frame
-    near its fastest) and recover; for hurt the recoil; for die the frame the body reaches the
+    detected from the motion: for strikes wind-up, impact (where the weapon hand stops after
+    its fastest motion) and recover; for hurt the recoil; for die the frame the body reaches the
     ground; for walks the foot contacts. take: the action to use when a file holds several. name:
     the clip name for a single file (default the file name).
     Writes <library>/<clip>.json and updates <library>/index.json; the library is

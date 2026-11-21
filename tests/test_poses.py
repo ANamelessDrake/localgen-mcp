@@ -198,6 +198,21 @@ def test_metadata_finds_the_strike():
     assert 2 <= labels["wind_up"] < meta["impact_frame"] and labels["recover"] > meta["impact_frame"]
 
 
+def test_chop_impact_is_where_the_blow_stops_not_the_top_of_the_swing():
+    """Hand raised slowly to its highest (and farthest from the chest) at frame 8, brought down
+    hard in two frames, stopped on the block at frame 10 and held: the impact is 10, the wind-up 8."""
+    frames = 16
+    pos = np.zeros((frames, len(pm.NAMES), 3))
+    pos[:, pm.INDEX["chest"]] = [0, 0, 1.3]
+    z = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.1, 2.2, 2.3, 1.4, 0.5, 0.5, 0.5, 0.52, 0.55, 0.6]
+    pos[:, pm.INDEX["hand_r"]] = [[-0.2, -0.3, h] for h in z]
+    pos[:, pm.INDEX["hand_l"]] = [0.2, -0.1, 1.0]
+    clip = {"frames": {"positions": pos.tolist()}, "fps": 25.0, "rest": {"stature": 1.75}}
+    meta = pm.analyse(clip, name="chop_wood", weapon_hand="right")
+    assert meta["action"] == "chop" and meta["impact_frame"] == 10
+    assert {k["label"]: k["frame"] for k in meta["key_frames"]}["wind_up"] == 8
+
+
 def test_names_set_action_loop_and_hand():
     meta = pf.synthetic_clip(name="HammeringGround01_L - Loop")["metadata"]
     assert (meta["action"], meta["loop"], meta["weapon_hand"], meta["weapon_hand_source"]) == \

@@ -83,6 +83,8 @@ ACTION_WORDS = (  # first match wins, so "BlockShield01 - Hit" is a block and no
     ("jump", "jump"),
 )
 STRIKES = ("attack", "chop", "hammer")
+STOP_SHARE = 0.25   # a strike's hand "stops" when it moves under this share of its peak speed
+STOP_WINDOW = 6     # frames after the peak in which to look for the stop
 LOOPING = ("walk", "run", "idle")
 
 
@@ -648,8 +650,9 @@ def analyse(clip: dict, *, name: str, action: str | None = None, loop: bool | No
             weapon_hand: str | None = None) -> dict:
     """Metadata for a clip: action tag, loop flag, weapon hand and suggested key frames.
 
-    Strikes (attack, chop, hammer): impact is the weapon hand's most extended frame (distance from
-    the chest) within a frame or so of its fastest; wind-up is the frame before impact where the
+    Strikes (attack, chop, hammer): impact is the frame the weapon hand all but stops after its
+    fastest motion (the blow lands), or, when it never stops, its most extended frame (distance
+    from the chest) near the fastest; wind-up is the frame before impact where the
     hand is pulled back furthest against the strike direction; recover is where it comes back
     closest to its start.
     Hurt: impact is the largest recoil of the head from the first frame. Die: impact is the first
@@ -684,9 +687,18 @@ def analyse(clip: dict, *, name: str, action: str | None = None, loop: bool | No
         hand = pos[:, J[f"hand_{weapon_hand[0]}"]]
         speed = _speed(hand, fps)[:usable]
         peak = int(np.argmax(speed))
-        reach = np.linalg.norm(hand - pos[:, J["chest"]], axis=-1)
-        lo, hi = max(0, peak - 1), min(last, peak + 3)
-        impact = lo + int(np.argmax(reach[lo:hi + 1]))
+        # The hit: the first frame from the fastest on where the hand all but stops (its step to
+        # the next frame under STOP_SHARE of the peak speed), within STOP_WINDOW frames. A swing
+        # that never stops (a slash through the air) takes its most extended frame near the peak.
+        step = np.linalg.norm(np.diff(hand, axis=0), axis=-1) * fps
+        stops = [t for t in range(peak, min(last, peak + STOP_WINDOW) + 1)
+                 if t < len(step) and step[t] < STOP_SHARE * speed[peak]]
+        if stops:
+            impact = stops[0]
+        else:
+            reach = np.linalg.norm(hand - pos[:, J["chest"]], axis=-1)
+            lo, hi = max(0, peak - 1), min(last, peak + 3)
+            impact = lo + int(np.argmax(reach[lo:hi + 1]))
         if impact > 0:
             # Wind-up: the hand pulled back furthest against the strike (hand from chest, along the
             # direction it points at impact).
@@ -716,16 +728,11 @@ def analyse(clip: dict, *, name: str, action: str | None = None, loop: bool | No
         low = z.min()
         down = np.nonzero(z <= low + 0.15 * max(z[0] - low, 1e-6))[0]
         impact = int(down[0]) if len(down) else last
-        head = pos[:usable, J["head"]]
         if impact > 1:
-            hit = int(np.argmax(_speed(pos[:impact, J["chest"]], fps)))
-            if 0 < hit < impact:
-                keys.append((hit, "hit"))
-            keys.append(((max(hit, 0) + impact) // 2, "falling"))
+            keys.append((impact // 2, "falling"))
         keys.append((impact, "ground"))
         if impact < last:
             keys.append((last, "lying"))
-        del head
     elif frames >= 3 and tag in ("walk", "run"):
         sep = pos[:usable, J["toe_l"], 1] - pos[:usable, J["toe_r"], 1]  # forward is -Y
         keys.append((int(np.argmin(sep)), "contact_left"))
@@ -748,7 +755,7 @@ def analyse(clip: dict, *, name: str, action: str | None = None, loop: bool | No
             "weapon_hand_source": hand_src, "stature": round(stature, 4), "duration": round(frames / fps, 4)}
 
 
-KEY_PRIORITY = ("impact", "ground", "wind_up", "start", "recover", "contact_left", "contact_right", "hit",
+KEY_PRIORITY = ("impact", "ground", "wind_up", "start", "recover", "contact_left", "contact_right",
                 "falling", "follow_through", "staggered", "lying", "end", "passing")
 
 
