@@ -1,4 +1,5 @@
-"""Pixel art sprite tools: generate_sprite, generate_animation, generate_tileset, pack_sheet, pixelize.
+"""Pixel art sprite tools: generate_sprite, generate_animation, import_sprite_sheet, render_pose_guides,
+generate_tileset, pack_sheet, pixelize.
 
 Built on the existing pipeline, no second one:
   drawing      the image workflows (Z-Image Turbo; FLUX.2 Klein with style references or an edit),
@@ -520,7 +521,8 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
                              timeout: float = 900, progress: Progress = None, pose_clip: str | None = None,
                              body: str | dict | None = None, view: str | float = "front", elevation: float = 15.0,
                              guide_style: str = "capsule", weapon: str | list[str] | None = None,
-                             exaggerate: float = 1.0, frame_selection: str = "auto") -> dict:
+                             exaggerate: float = 1.0, frame_selection: str = "auto", gif_loops: int = 1) -> dict:
+    check_gif_loops(gif_loops)
     if not 2 <= frames <= 16:
         raise ValueError("frames must be between 2 and 16")
     if not 0 <= retries <= 5:
@@ -667,7 +669,8 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
                                       "contact": str(outdir / f"{stem}_contact.png")}, strip)
     gif = outdir / f"{stem}_preview.gif"
     await run_ops(settings, {"op": "animate", "frames": [str(f) for f in finals], "output": str(gif), "fps": rate,
-                             "durations": durations, "zoom": max(1, 256 // size), "loop": info["loop"]}, gif)
+                             "durations": durations, "zoom": max(1, 256 // size), "loop": info["loop"],
+                             "cycles": gif_loops}, gif)
     impact, pose_data = None, None
     if pose_report:
         impact = pose_report["impact_index"]
@@ -696,6 +699,11 @@ async def generate_animation(settings: Settings, sprite_or_prompt: str, action: 
         "paths": [str(strip), str(json_path), str(gif), *map(str, finals)],
         "base": base.get("generated"), "total_seconds": round(time.time() - t0, 2),
     }
+
+
+def check_gif_loops(gif_loops: int) -> None:
+    if not 1 <= int(gif_loops) <= 20:
+        raise ValueError("gif_loops (cycles per GIF file) must be between 1 and 20")
 
 
 def _m(m: dict) -> dict:
@@ -732,6 +740,177 @@ async def _base_from_image(settings: Settings, src: Path, outdir: Path, st: dict
     o = px["outputs"][0]
     return {"reference": str(ref), "source": source, "sprite": o["path"], "palette": px["palette"],
             "scale": o["scale"]}
+
+
+# -- import_sprite_sheet -----------------------------------------------------
+
+SHEET_BACKGROUNDS = ("key", "birefnet")
+MISMATCH_MODES = ("fail", "keep")
+
+
+def check_sheet_options(frames, rows, columns, background, key_threshold, on_count_mismatch) -> None:
+    if frames is not None and not 1 <= int(frames) <= 64:
+        raise ValueError("frames must be between 1 and 64 (or None to take every frame found)")
+    if rows is not None and not 1 <= int(rows) <= 16:
+        raise ValueError("rows must be between 1 and 16")
+    if columns is not None and not 1 <= int(columns) <= 32:
+        raise ValueError("columns must be between 1 and 32")
+    if background not in SHEET_BACKGROUNDS:
+        raise ValueError(f"background must be one of {list(SHEET_BACKGROUNDS)}")
+    if not 5 <= float(key_threshold) <= 300:
+        raise ValueError("key_threshold must be between 5 and 300 (summed RGB difference)")
+    if on_count_mismatch not in MISMATCH_MODES:
+        raise ValueError(f"on_count_mismatch must be one of {list(MISMATCH_MODES)}")
+
+
+async def import_sprite_sheet(settings: Settings, image: str, *, frames: int | None = None, rows: int | None = None,
+                              columns: int | None = None, size: int = 64, palette=None, max_colors: int = 32,
+                              outline: bool = True, outline_color: str = "auto", shading_steps: int | None = None,
+                              saturation: float = 1.0, blur: float = 0.5, background: str = "key",
+                              key_threshold: float = 45, ground_shadow: bool = True,
+                              on_count_mismatch: str = "fail", action: str | None = None, fps: int | None = None,
+                              loop: bool | None = None, gif_loops: int = 1, name: str | None = None,
+                              output_dir: str | None = None, idle_timeout_seconds: int | None = None,
+                              timeout: float = 900, progress: Progress = None) -> dict:
+    """Cut a sprite sheet from anywhere (another image model, an artist, another tool) into aligned
+    frames and pixelize them with one palette: the same outputs as generate_animation."""
+    src = image_input(image, "image")
+    check_sheet_options(frames, rows, columns, background, key_threshold, on_count_mismatch)
+    check_gif_loops(gif_loops)
+    check_pixel_options(size=size, max_colors=max_colors, outline_color=outline_color, shading_steps=shading_steps,
+                        saturation=saturation, blur=blur)
+    pal = resolve_palette(settings, palette)
+    preset = ACTIONS.get((action or "").lower().strip())
+    rate = int(fps) if fps else int(preset["fps"] if preset else GENERIC_FPS)
+    if not 1 <= rate <= 60:
+        raise ValueError("fps must be between 1 and 60")
+    looping = bool(preset["loop"] if preset else True) if loop is None else bool(loop)
+    outdir = out_dir(settings, output_dir)
+    stem = unique_stem(outdir, f"{slug(name or src.stem, 6)}_import")
+    t0 = time.time()
+    overlay = outdir / f"{stem}_overlay.png"
+    try:
+        found = await run_ops(settings, {"op": "import_sheet", "input": str(src), "frames": frames, "rows": rows,
+                                         "columns": columns, "background": "key" if background == "key" else "keep",
+                                         "key_threshold": key_threshold, "shadow": ground_shadow,
+                                         "on_mismatch": on_count_mismatch, "output_prefix": str(outdir / stem),
+                                         "overlay": str(overlay)}, overlay)
+    except PixelError as exc:
+        if overlay.is_file():  # a count mismatch still draws the boxes it found
+            raise PixelError(f"{exc} Overlay of what was found: {overlay}") from None
+        raise
+    cells = found["cells"]
+    sources = cells
+    if background == "birefnet":
+        cuts = await cut(settings, cells, outdir, idle_timeout_seconds, timeout, progress)
+        sources = [_move(c, outdir / f"{stem}_c{i:02d}_source.png") for i, c in enumerate(cuts)]
+    finals = [outdir / f"{stem}_f{i:02d}.png" for i in range(len(sources))]
+    # fit="frame": every canvas has one size, ground line and anchor, so one scale keeps the motion.
+    st = {"outline": outline, "outline_color": outline_color, "shading_steps": shading_steps,
+          "saturation": saturation}
+    items = [{"input": s, "output": str(f), "fit": "frame"} for s, f in zip(sources, finals)]
+    palette_out = outdir / f"{stem}_palette.gpl" if pal is None else None
+    px = await run_ops(settings, pixel_spec(size, pal, max_colors, st, blur, items, palette_out), finals[-1])
+    measured = (await run_ops(settings, {"op": "metrics", "base": str(finals[0]), "frames": [str(f) for f in finals]},
+                              finals[-1]))["frames"]
+    strip = outdir / f"{stem}_strip.png"
+    packed = await run_ops(settings, {"op": "pack", "images": [{"name": f"{stem}_{i:02d}", "path": str(f)}
+                                                              for i, f in enumerate(finals)],
+                                      "cell": [size, size], "columns": len(finals), "power_of_two": False,
+                                      "sheet": str(strip), "atlas": str(outdir / f"{stem}_strip_atlas.json"),
+                                      "contact": str(outdir / f"{stem}_contact.png")}, strip)
+    gif = outdir / f"{stem}_preview.gif"
+    await run_ops(settings, {"op": "animate", "frames": [str(f) for f in finals], "output": str(gif), "fps": rate,
+                             "zoom": max(1, 256 // size), "loop": looping, "cycles": gif_loops}, gif)
+    per_frame = [{**fr, "motion": motion(m), "colours_used": o["colours_used"], "clipped": o["clipped"]}
+                 for fr, m, o in zip(found["frames"], measured, px["outputs"])]
+    moves = [f["motion"] for f in per_frame[1:]] or [0.0]
+    warnings = [] if found["count_ok"] else list(found["problems"])
+    if any(f["clipped"] for f in per_frame):
+        warnings.append("part of a frame fell outside its cell")
+    summary = {"frames": len(finals), "motion_mean": round(sum(moves) / len(moves), 4), "motion_min": min(moves),
+               "static_frames": sum(m < 0.02 for m in moves)}
+    sheet_report = {k: found[k] for k in ("frames_found", "frames_expected", "rows_found", "per_row", "count_ok",
+                                           "problems", "background", "canvas", "ground_line", "anchor_column",
+                                           "notes")}
+    data = {"name": stem, "action": action, "source_sheet": str(src), "frame_count": len(finals),
+            "frame_size": [size, size], "fps": rate, "loop": looping, "strip": strip.name,
+            "frames": [f.name for f in finals], "palette": px["palette"], "background_removal": background,
+            "sheet": sheet_report, "consistency": summary, "per_frame": per_frame}
+    json_path = outdir / f"{stem}.json"
+    json_path.write_text(json.dumps(data, indent=1))
+    return {
+        "strip": str(strip), "frames": [str(f) for f in finals], "json": str(json_path), "preview_gif": str(gif),
+        "contact_sheet": packed["contact_sheet"], "atlas": packed["atlas"], "overlay": str(overlay),
+        "cells": sources, "palette": px["palette"],
+        "palette_file": px.get("palette_file") or (pal if isinstance(pal, str) else None),
+        "fps": rate, "loop": looping, "gif_loops": gif_loops, "sheet": sheet_report, "consistency": summary,
+        "per_frame": per_frame, "warnings": warnings, "output_dir": str(outdir),
+        "paths": [str(strip), str(json_path), str(gif), *map(str, finals)],
+        "total_seconds": round(time.time() - t0, 2),
+    }
+
+
+# -- render_pose_guides ------------------------------------------------------
+
+GUIDE_SHEET_BACKGROUND = {"capsule": "#d8d8d8", "skeleton": "#000000"}
+SHEET_COLUMNS = 6
+
+
+async def render_pose_guides(settings: Settings, pose_clip: str, *, frames: int = 6, body: str | dict | None = None,
+                             view: str | float = "right", elevation: float = 0.0, guide_style: str = "capsule",
+                             weapon: str | list[str] | None = None, exaggerate: float = 1.0,
+                             frame_selection: str = "auto", size: int = 512, layout: int | None = None,
+                             sheet_size: list[int] | None = None, name: str | None = None,
+                             output_dir: str | None = None) -> dict:
+    """The pose guides of a baked clip as one sheet image (and one image per frame), to give another
+    image model as a pose reference for a sheet that import_sprite_sheet then cuts."""
+    if not 1 <= frames <= 32:
+        raise ValueError("frames must be between 1 and 32")
+    if not 64 <= size <= 2048:
+        raise ValueError("size must be between 64 and 2048 pixels")
+    if layout is not None and not 1 <= int(layout) <= 32:
+        raise ValueError("layout (columns) must be between 1 and 32")
+    if sheet_size is not None and (len(sheet_size) != 2 or not all(64 <= int(v) <= 4096 for v in sheet_size)):
+        raise ValueError("sheet_size must be [width, height], 64 to 4096 pixels each")
+    if guide_style not in GUIDE_WORDS:
+        raise ValueError(f"guide_style must be one of {list(GUIDE_WORDS)}")
+    clip_path, clip_label = poses_lib.resolve_clip(settings, pose_clip)
+    outdir = out_dir(settings, output_dir)
+    stem = unique_stem(outdir, f"{slug(name or clip_label, 4)}_guides")
+    outs = [outdir / f"{stem}_f{i:02d}.png" for i in range(frames)]
+    cols = int(layout) if layout else min(frames, SHEET_COLUMNS)
+    guide_size = [size, size]
+    if sheet_size:  # draw each guide at its cell's shape, so the figure fills the cell once scaled
+        cw, ch = int(sheet_size[0]) // cols, int(sheet_size[1]) // -(-frames // cols)
+        guide_size = [max(16, round(size * cw / max(cw, ch))), max(16, round(size * ch / max(cw, ch)))]
+    rep = await run_ops(settings, {"op": "pose_guides", "clip": str(clip_path), "frames": frames,
+                                   "selection": frame_selection, "body": body, "view": view, "elevation": elevation,
+                                   "style": guide_style, "weapon": weapon, "exaggerate": exaggerate,
+                                   "size": guide_size, "outputs": [str(o) for o in outs],
+                                   "contact": str(outdir / f"{stem}_contact.png")}, outs[-1])
+    sheet = outdir / f"{stem}_sheet.png"
+    grid = await run_ops(settings, {"op": "grid", "images": rep["paths"], "columns": cols,
+                                    "canvas": [int(v) for v in sheet_size] if sheet_size else None,
+                                    "background": GUIDE_SHEET_BACKGROUND[guide_style], "output": str(sheet)}, sheet)
+    rows = grid["rows"]
+    layout_words = "one row" if rows == 1 else f"{rows} rows of {grid['columns']}"
+    hint = (f"The pose reference image shows {frames} poses of {GUIDE_WORDS[guide_style]}, laid out as "
+            f"{layout_words}, read left to right then top to bottom. Draw the character once per pose, in the "
+            "same layout, each frame in the exact pose of the matching figure; do not draw the reference figure "
+            "or its colours.")
+    data = {"clip": rep["clip"], "clip_file": str(clip_path), "action": rep["action"], "loop": rep["loop"],
+            "frames": frames, "clip_frames": rep["clip_frames"], "labels": rep["labels"],
+            "impact_index": rep["impact_index"], "durations_ms": rep["durations_ms"], "body": rep["body"],
+            "view": view, "elevation": elevation, "style": guide_style, "weapons": rep["weapons"],
+            "weapon_hand": rep["weapon_hand"], "columns": grid["columns"], "rows": rows, "sheet_size": grid["size"],
+            "cells": grid["cells"], "prompt_hint": hint}
+    json_path = outdir / f"{stem}.json"
+    json_path.write_text(json.dumps(data, indent=1))
+    return {"sheet": str(sheet), "frames": rep["paths"], "json": str(json_path), "contact_sheet": rep["contact"],
+            **{k: data[k] for k in ("clip", "action", "loop", "clip_frames", "labels", "impact_index",
+                                    "durations_ms", "columns", "rows", "sheet_size", "prompt_hint")},
+            "output_dir": str(outdir), "paths": [str(sheet), str(json_path), *rep["paths"]]}
 
 
 # -- generate_tileset --------------------------------------------------------

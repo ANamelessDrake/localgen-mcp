@@ -890,7 +890,7 @@ _STYLE_DOC = """
 def _pixel_doc(fn):
     """Append the shared pixel pass description to a sprite tool's docstring (before registration);
     the generators also get the style description."""
-    style = _STYLE_DOC if fn.__name__ != "pixelize" else ""
+    style = _STYLE_DOC if fn.__name__ not in ("pixelize", "import_sprite_sheet") else ""
     fn.__doc__ = fn.__doc__.rstrip() + "\n" + _PIXEL_DOC + style
     return fn
 
@@ -974,6 +974,7 @@ async def generate_animation(
     weapon: str | list[str] | None = None,
     exaggerate: float = 1.0,
     frame_selection: str = "auto",
+    gif_loops: int = 1,
     ctx: Context | None = None,
 ) -> dict:
     """An animation strip for one character: frames (2 to 16) of size x size pixel art.
@@ -1018,7 +1019,8 @@ async def generate_animation(
     placeholder or a reference for an artist.
     Output: <name>_<action>_<seed>_strip.png (frames left to right), _fNN.png frames, .json (frame
     count, size, fps, loop, palette, per frame metrics), _preview.gif, _contact.png, plus each frame's
-    drawing and cut-out. About 8 to 15 s per frame warm.
+    drawing and cut-out. gif_loops: how many cycles the preview GIF holds (default 1; 3 is easier to
+    review). About 8 to 15 s per frame warm.
     """
     return await sprites.generate_animation(
         settings, sprite_or_prompt, action, frames=frames, size=size, palette=palette, max_colors=max_colors,
@@ -1027,7 +1029,103 @@ async def generate_animation(
         min_iou=min_iou, max_hist_distance=max_hist_distance, min_motion=min_motion, fps=fps, seed=seed, name=name, output_dir=output_dir,
         idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx),
         pose_clip=pose_clip, body=body, view=view, elevation=elevation, guide_style=guide_style, weapon=weapon,
-        exaggerate=exaggerate, frame_selection=frame_selection)
+        exaggerate=exaggerate, frame_selection=frame_selection, gif_loops=gif_loops)
+
+
+@mcp.tool()
+@_pixel_doc
+async def import_sprite_sheet(
+    image: str,
+    frames: int | None = None,
+    rows: int | None = None,
+    columns: int | None = None,
+    size: int = 64,
+    palette: str | list[str] | None = None,
+    max_colors: int = 32,
+    outline: bool = True,
+    outline_color: str = "auto",
+    shading_steps: int | None = None,
+    saturation: float = 1.0,
+    blur: float = 0.5,
+    background: str = "key",
+    key_threshold: float = 45,
+    ground_shadow: bool = True,
+    on_count_mismatch: str = "fail",
+    action: str | None = None,
+    fps: int | None = None,
+    loop: bool | None = None,
+    gif_loops: int = 1,
+    name: str | None = None,
+    output_dir: str | None = None,
+    idle_timeout_seconds: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Cut a sprite sheet from anywhere (another image model, an artist, another tool) into aligned pixel art frames.
+
+    image: a sheet of one character's animation frames on a flat background (or a transparent one),
+    roughly in a grid: one row, or rows read left to right then top to bottom. The background colour
+    is read from the sheet's edge; frames are found as row bands and column runs of the pixels that
+    differ from it (narrow detached pieces such as a tool head join their frame; frames that touch
+    are split). frames: the count expected (None takes what is found); rows and columns: the grid
+    expected. When the count found differs, on_count_mismatch "fail" (default) stops with what was
+    found per row, "keep" carries on and warns. Every frame is moved onto one square canvas, its
+    lowest pixel on a common ground line and the middle of its torso band on a common vertical, so
+    the frames share one scale and nothing jitters; then pixelized with fit="frame" and one palette
+    (a given palette, or an auto palette from all frames together). background: "key" (default)
+    keys out the flat colour (key_threshold: summed RGB difference, default 45); "birefnet" cuts
+    each frame out with BiRefNet on the GPU instead (for a sheet whose background is not flat).
+    ground_shadow (default True) clears a flat grey shadow or ground line drawn under the feet.
+    action ("walk", "idle", ...) only sets the default fps and loop; gif_loops: cycles in the
+    preview GIF (default 1; 3 is easier to review).
+    Output (<output_dir or /ai/output/localgen/sprite/<date>>): <name>_import_strip.png, _fNN.png
+    frames, .json (frame count, size, fps, loop, palette, what was found, per frame sheet box and
+    motion), _preview.gif, _contact.png, _overlay.png (the sheet with the boxes found, the anchor in
+    blue and the ground in green), and the aligned full resolution cells (_cNN.png). CPU only, a
+    few seconds, unless background="birefnet".
+    """
+    return await sprites.import_sprite_sheet(
+        settings, image, frames=frames, rows=rows, columns=columns, size=size, palette=palette,
+        max_colors=max_colors, outline=outline, outline_color=outline_color, shading_steps=shading_steps,
+        saturation=saturation, blur=blur, background=background, key_threshold=key_threshold,
+        ground_shadow=ground_shadow, on_count_mismatch=on_count_mismatch, action=action, fps=fps, loop=loop,
+        gif_loops=gif_loops, name=name, output_dir=output_dir, idle_timeout_seconds=idle_timeout_seconds,
+        timeout=TIMEOUTS["image"], progress=_progress(ctx))
+
+
+@mcp.tool()
+async def render_pose_guides(
+    pose_clip: str,
+    frames: int = 6,
+    body: str | dict | None = None,
+    view: str | float = "right",
+    elevation: float = 0.0,
+    guide_style: str = "capsule",
+    weapon: str | list[str] | None = None,
+    exaggerate: float = 1.0,
+    frame_selection: str = "auto",
+    size: int = 512,
+    layout: int | None = None,
+    sheet_size: list[int] | None = None,
+    name: str | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    """Draw a baked pose clip's poses as one sheet image, to hand another image model as a pose reference.
+
+    The same guides generate_animation(pose_clip=...) uses (see there for pose_clip, body, view,
+    elevation, guide_style, weapon, exaggerate and frame_selection), drawn size x size each (default
+    512) and laid out left to right, then top to bottom: layout is the number of columns (default
+    rows of up to 6). sheet_size [width, height] fits the layout onto a canvas of that size (each
+    pose scaled into its cell), to match the size the other model draws at. view defaults to
+    "right" (side on, the character facing right). The result's prompt_hint is wording to add to
+    the other model's prompt; import_sprite_sheet then cuts what it draws.
+    Output (<output_dir or /ai/output/localgen/sprite/<date>>): <name>_guides_sheet.png, one
+    _fNN.png per pose, _contact.png (labelled with the clip frames) and .json (clip frames, key
+    labels, impact index, frame durations from the clip's timing, layout). CPU only, a second or two.
+    """
+    return await sprites.render_pose_guides(
+        settings, pose_clip, frames=frames, body=body, view=view, elevation=elevation, guide_style=guide_style,
+        weapon=weapon, exaggerate=exaggerate, frame_selection=frame_selection, size=size, layout=layout,
+        sheet_size=sheet_size, name=name, output_dir=output_dir)
 
 
 @mcp.tool()

@@ -507,7 +507,8 @@ def test_no_project_words_in_tool_names_parameters_or_defaults():
 
     tools = asyncio.run(server.mcp.list_tools())
     for t in tools:
-        if t.name not in ("generate_sprite", "generate_animation", "generate_tileset", "pack_sheet", "pixelize"):
+        if t.name not in ("generate_sprite", "generate_animation", "generate_tileset", "pack_sheet", "pixelize",
+                          "import_sprite_sheet", "render_pose_guides"):
             continue
         schema = json.dumps(t.inputSchema).lower()
         for word in PROJECT_WORDS:

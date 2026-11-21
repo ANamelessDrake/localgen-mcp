@@ -26,6 +26,8 @@ A local MCP server that lets agents generate images, video and 3D meshes on this
 | `upscale_image` | Upscale a PNG or JPEG 2x or 4x with a super resolution model: Real-ESRGAN x4plus for concept art and general images, or 4x-PBRify V4 (`model="pbrify-v4"`) for game textures. Keeps transparency. A few seconds to a minute. |
 | `generate_sprite` | One pixel art game sprite on a transparent background at an exact size (default 64 x 64): drawn at 1024, cut out, pixelized to a palette with a 1 pixel outline. Writes the sprite, an 8x preview and the full resolution cut-out for hand fixes. `views="turnaround"` makes front, left, back and right at one scale. |
 | `generate_animation` | An animation strip for one character (idle, walk, chop, attack, hurt, die, or your own poses): FLUX.2 Klein edits of the base drawing, one shared palette, per frame consistency metrics with retries, a strip PNG, the frames, a JSON and a GIF preview. With `pose_clip`, every frame copies the pose of a baked mocap clip (below). |
+| `import_sprite_sheet` | Cut a sprite sheet drawn anywhere (another image model, an artist, another tool) into frames on one ground line and one torso column, key out the flat background (or BiRefNet), and pixelize them with one palette: the same strip, frames, JSON and GIF as `generate_animation`. Checks the frame count and grid (below). CPU only. |
+| `render_pose_guides` | A baked pose clip's poses drawn as one sheet image (and one image per pose), sized to match another model's canvas, to send as a pose reference with a prompt hint. CPU only. |
 | `bake_pose_library` | Bake FBX or BVH mocap clips into the pose library once (headless Blender): about 20 humanoid joints per frame, positions and local rotations, in place, with an action tag, loop flag, weapon hand and key frames (wind-up, impact, recover). |
 | `list_pose_clips` | The clips in the pose library, with their action, length, impact frame and key frames. |
 | `generate_tileset` | Terrain and building tiles on one grid and one palette, packed on a power of two sheet with an atlas. Tile kinds are yours to name; ground kinds can be seamless. |
@@ -195,7 +197,7 @@ Limits: the maps are derived from the colour, so relief follows brightness, not 
 
 ### Pixel art sprites
 
-Five tools make 2D game sprites. They reuse the existing pipeline: the image workflows draw (Z-Image Turbo; FLUX.2 Klein for style references and animation frames), `remove_background`'s BiRefNet pass cuts out, the seamless material graph makes ground tiles, and `generate_turnaround` makes views. Only the pixel pass is new.
+Seven tools make 2D game sprites (two of them, `import_sprite_sheet` and `render_pose_guides`, for sheets drawn elsewhere: see [Sheets from another image model](#sheets-from-another-image-model)). They reuse the existing pipeline: the image workflows draw (Z-Image Turbo; FLUX.2 Klein for style references and animation frames), `remove_background`'s BiRefNet pass cuts out, the seamless material graph makes ground tiles, and `generate_turnaround` makes views. Only the pixel pass is new.
 
 - **The pixel pass** (`pixelize`, used by all of them) runs in `src/localgen_mcp/pixel_ops.py`, a numpy and Pillow helper the server starts as a child process with its own interpreter (`python -I`), reading its final `PIXEL_OPS_RESULT {json}` line, the same pattern as the Blender scripts; the server process still imports no imaging library. Per image:
   1. **Place:** one scale (source pixels per sprite pixel) maps the subject onto the size x size cell. `fit="trim"` fits the subject's box, `"frame"` the whole image (one scale for images framed alike, as turnaround views are), `"fill"` stretches the whole image (opaque tiles). `anchor="bottom"` stands the subject on the bottom edge, centred on its mass. A fixed scale can be passed, which is how animation frames keep the base sprite's size.
@@ -231,6 +233,36 @@ Five tools make 2D game sprites. They reuse the existing pipeline: the image wor
   - All outputs are reference and placeholder quality until an artist passes over them. The pass gets the grid, palette and outline right, but not the pixel level decisions (clusters, hand placed anti aliasing, readable 1 pixel details) a pixel artist makes. Line art thinner than one sprite pixel at the target size is lost.
   - Seamless tiles wrap because the seam repaint makes the drawing wrap, but the material graph's texture wording pulls them towards realistic surfaces; the style wording is added, yet cartoon ground comes out less stylised than objects.
   - Not made: auto tiling transition sets (the 47 tile blob for grass to forest or grass to water). Every tile is one cell; buildings larger than a tile are drawn into one cell.
+
+### Sheets from another image model
+
+The local models are weak at animation (above). A hosted image model that draws a whole sheet in one picture, such as OpenAI's image models, keeps a character and a gait together far better, so the flow for animations can be: an agent asks such a model for a sheet, then hands the file to this server, which does the rest locally. This server never calls an outside service; the agent makes that call with its own credentials, and the sheet is just an image file here.
+
+1. **Optional pose reference:** `render_pose_guides(pose_clip="walk", frames=6, body="stocky", sheet_size=[1536, 1024])` draws a baked clip's poses as one sheet (rows of up to 6, read left to right then top to bottom; `layout` sets the columns), each pose drawn at its cell's shape, side on and facing right by default (`view`). Its `prompt_hint` is wording to add to the prompt; the sheet goes to the other model as a second reference image after the character.
+2. **Draw:** the agent sends the character (a `generate_sprite` `_source.png` or `_raw.png`, or any drawing) as the reference image, with a prompt like the template below.
+3. **Import:** `import_sprite_sheet(image="walk_sheet.png", frames=6, rows=1, palette="moriveil", action="walk", gif_loops=3)` cuts it into the same outputs as `generate_animation`: strip, frames, JSON, atlas, contact sheet and GIF.
+
+**What `import_sprite_sheet` does.** The background colour is read from the sheet's edge (a transparent sheet uses its alpha). Frames are found as row bands, then column runs, of the pixels that differ from it, read left to right and then top to bottom, so uneven spacing and a short last row are fine. Specks are ignored, a narrow detached piece (the far end of a tool) joins the nearer frame, and frames whose outlines touch are split at the narrowest column. `frames`, `rows` and `columns` say what to expect; when the count found differs, `on_count_mismatch="fail"` (default) stops and says how many frames it found in each row (the `_overlay.png` shows the boxes), and `"keep"` carries on with a warning. Each frame is then moved onto one square canvas: its lowest pixel on a common ground line, and the median column of its torso band (35 to 60% of its own height, which a swinging tool or a stride moves far less than its box or its centre of mass) on a common vertical. A flat grey ground shadow drawn under the feet is cleared first (`ground_shadow`). The background is keyed out (`key_threshold`, summed RGB difference, default 45), or with `background="birefnet"` each aligned cell is cut out by BiRefNet on the GPU, for a sheet whose background is not flat. Every canvas is pixelized with `fit="frame"`, so all frames share one scale and the motion between them survives, with one palette (the one given, or an auto palette from all frames together). The JSON records what was found (frames per row, background, canvas, ground line, anchor column, notes such as joined pieces) and each frame's box on the sheet and its motion from the frame before. `action` only sets the default fps and loop; `gif_loops` (also on `generate_animation`) is the number of cycles in the preview GIF, 3 being easier to review than 1.
+
+**Prompt template** for a walk cycle sheet (replace the parts in brackets; for 12 frames use "laid out as two rows of 6 frames (frames 1 to 6 on the top row, 7 to 12 on the bottom row, read left to right)" and spell out the in between phases):
+
+```
+Pixel art game sprite sheet of the [character] in the reference image: a 6 frame walk cycle,
+side view facing right, all 6 frames in one horizontal row, evenly spaced, same size and same
+ground line in every frame. Classic walk cycle: contact, down, passing, up, then the same with
+the other leg forward; arms swing opposite to the legs. Keep its exact design: [the features that
+must not change: hair, clothing, colours, equipment]. [Art style: for example chunky warm cartoon
+pixel art, dark 1 pixel outline, flat shading with one highlight and one shadow], readable at
+[64] pixels. Plain flat light grey background, no text, no labels, no numbers, no shadows.
+```
+
+With a pose reference, add the `prompt_hint` and say that image 2 gives the poses ("the character from image 1 in the poses of image 2, one per frame"). A landscape canvas (1536 x 1024) suits one row of 6 and two rows of 6.
+
+**Limits seen on real sheets** (a 6 frame walk in one row and a 12 frame walk in two rows of 6, from one hosted model, with the character's cut-out as the reference):
+- The frames are not on an exact grid until imported: spacing and the baseline vary a little from frame to frame, and one sheet drew a grey ground shadow under every frame although the prompt asked for none. Both imported cleanly: 6 and 12 frames found, ground shadow cleared, torso and ground aligned.
+- The model may ignore prop placement: asked for the axe hanging from the belt, it kept the axe on the shoulder as in the reference.
+- The 12 frame sheet drifted towards a three-quarter view and smaller per frame motion (mean silhouette change 0.11 between frames against 0.16 for the 6 frame sheet, both at 64 px); the 6 frame sheet stayed side on.
+- The reference image goes to whichever service the agent uses; this server sends nothing anywhere.
 
 ### Idle timeout
 
