@@ -26,7 +26,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import backend, blender_run, config, cutout, jobs, materials, model_files, retopo, rig, speech, sprites, workflows
+from . import (backend, blender_run, config, cutout, jobs, materials, model_files, poses, retopo, rig, speech,
+               sprites, workflows)
 from .workflows.image_edit import edit_images
 from .workflows.part_isolate import part_prompt
 
@@ -965,9 +966,36 @@ async def generate_animation(
     seed: int | None = None,
     output_dir: str | None = None,
     idle_timeout_seconds: int | None = None,
+    pose_clip: str | None = None,
+    body: str | dict | None = None,
+    view: str | float = "front",
+    elevation: float = 15.0,
+    guide_style: str = "capsule",
+    weapon: str | list[str] | None = None,
+    exaggerate: float = 1.0,
+    frame_selection: str = "auto",
     ctx: Context | None = None,
 ) -> dict:
     """An animation strip for one character: frames (2 to 16) of size x size pixel art.
+
+    Pose driven (pose_clip set): each frame copies the pose of a baked mocap clip (bake_pose_library,
+    list_pose_clips). pose_clip: a clip name, an action tag (the first clip with it) or a clip .json.
+    The clip is retargeted to `body` ("human" default, "stocky": short legs, broad, big head;
+    "small": short, big head, long arms; "tall"; or a dict of factors legs, feet, arms, torso, neck,
+    head, shoulders, hips, thickness, with optional "base" preset), seen from `view` ("front",
+    "back", "left", "right", "front_left", "front_right", "back_left", "back_right" or an azimuth in
+    degrees; "left" sees the character's left side) at `elevation` degrees (0 side on, 30 to 60 for
+    a top down 3/4 strategy camera), and drawn as a guide the size of the base drawing, the figure
+    standing where the base character stands: guide_style "capsule" (a shaded mannequin, near limbs
+    over far ones) or "skeleton" (OpenPose colours). weapon: "dagger", "sword", "axe", "warhammer",
+    "spear", "shield" or [weapon, "shield"] drawn in the clip's weapon hand (a shield in the other
+    hand). exaggerate: 1 keeps the motion, 1.3 pushes every joint 30% further from the clip's
+    average pose. frame_selection: "auto" (loops: frames evenly over the cycle; one shot actions:
+    the key poses, the impact frame always included), "even" or "keys". Each frame is a Klein edit
+    with the base drawing as image 1 and the frame's guide as image 2; retries keep the guide. The
+    result adds impact_frame (index in the strip, or null), per frame clip frames and key labels,
+    frame durations from the clip's timing (used by the GIF; fps is their average) and the guides.
+    Without pose_clip, behaviour is as below.
 
     sprite_or_prompt: an image of the character (a generate_sprite _raw.png or _source.png is best; a
     finished small sprite is scaled up to serve as the reference) or a prompt, from which a base
@@ -997,7 +1025,55 @@ async def generate_animation(
         style=style, outline=outline, outline_color=outline_color, shading_steps=shading_steps,
         saturation=saturation, blur=blur, subject=subject, frame_prompts=frame_prompts, retries=retries,
         min_iou=min_iou, max_hist_distance=max_hist_distance, min_motion=min_motion, fps=fps, seed=seed, name=name, output_dir=output_dir,
-        idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx))
+        idle_timeout_seconds=idle_timeout_seconds, timeout=TIMEOUTS["image"], progress=_progress(ctx),
+        pose_clip=pose_clip, body=body, view=view, elevation=elevation, guide_style=guide_style, weapon=weapon,
+        exaggerate=exaggerate, frame_selection=frame_selection)
+
+
+@mcp.tool()
+async def bake_pose_library(
+    inputs: list[str],
+    name: str | None = None,
+    action: str | None = None,
+    loop: bool | None = None,
+    weapon_hand: str | None = None,
+    take: str | None = None,
+    root_motion: str = "in_place",
+    recursive: bool = True,
+) -> dict:
+    """Bake mocap clips into the pose library that generate_animation(pose_clip=...) draws from.
+
+    Blender runs once here; every later sprite sheet draws its pose guides in plain Python. inputs:
+    FBX or BVH files, or folders of them (recursive by default; up to 500 files per call). Each
+    clip's armature is mapped to about 20 humanoid joints (pelvis, spine, chest, neck, head,
+    shoulders, elbows, wrists, hands, hips, knees, ankles, toes) by bone name rules that cover
+    Mixamo (with or without the mixamorig: prefix), Unity Humanoid, the Unreal mannequin, "B-" rigs
+    with .L/.R suffixes, 3ds Max Biped and CMU BVH names. Every frame's joint positions and local
+    rotations are stored with the rest bone lengths and fps, facing normalised (the character faces
+    the front camera), the floor at 0, and root motion removed ("in_place", default) or kept
+    relative to the first frame ("keep").
+    Metadata per clip: action tag (from `action` or the file name: walk, run, idle, attack, chop,
+    hammer, hurt, die, block, jump), loop (from `loop`, or "loop" in the name, or a looping action),
+    weapon hand (`weapon_hand`, an _L/_R in the name, or the hand that moves most), and key frames
+    detected from the motion: for strikes wind-up, impact (where the weapon hand stops after
+    its fastest motion) and recover; for hurt the recoil; for die the frame the body reaches the
+    ground; for walks the foot contacts. take: the action to use when a file holds several. name:
+    the clip name for a single file (default the file name).
+    Writes <library>/<clip>.json and updates <library>/index.json; the library is
+    LOCALGEN_POSE_DIR (default /ai/data/localgen/poses), outside the repository. A file that fails
+    is listed under "failed" with the reason and the others are still baked. Headless Blender on the
+    CPU, about a second per clip.
+    """
+    return await poses.bake_pose_library(settings, inputs, name=name, action=action, loop=loop,
+                                         weapon_hand=weapon_hand, take=take, root_motion=root_motion,
+                                         recursive=recursive)
+
+
+@mcp.tool()
+async def list_pose_clips(action: str | None = None) -> dict:
+    """Clips in the pose library (bake_pose_library adds them): name, action, loop, frame count, fps,
+    duration, impact frame, weapon hand, key frames and source file. action: only clips with this tag."""
+    return await asyncio.to_thread(poses.list_pose_clips, settings, action)
 
 
 @mcp.tool()
