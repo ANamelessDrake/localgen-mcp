@@ -4,7 +4,8 @@
 
 Run as a child process with the MCP venv's interpreter (numpy and Pillow); the MCP server never
 imports this module, so it stays free of imaging libraries. The spec's "op" picks the operation
-(pixelize, metrics, pack, flatten, animate, pose_guides); the last stdout line is "PIXEL_OPS_RESULT {json}".
+(pixelize, metrics, pack, flatten, animate, pose_guides, import_sheet, grid); the last stdout line is
+"PIXEL_OPS_RESULT {json}".
 The file imports nothing from the package, so it runs by path with -I (no script folder or
 current folder on sys.path). The tests import its functions directly.
 
@@ -677,9 +678,13 @@ def op_flatten(spec: dict) -> dict:
 
 
 def op_animate(spec: dict) -> dict:
-    """spec: frames [paths], output (.gif), fps or durations [ms per frame], zoom, background (#rrggbb), loop: a looping GIF
-    preview of an animation, each frame scaled up by zoom and flattened on the background (GIF has
-    no partial transparency)."""
+    """spec: frames [paths], output (.gif), fps or durations [ms per frame], zoom, background (#rrggbb), loop,
+    cycles: a GIF preview of an animation, each frame scaled up by zoom and flattened on the
+    background (GIF has no partial transparency). cycles (default 1) plays the frames that many
+    times in the one file, which is easier to review in viewers that play a GIF once."""
+    cycles = int(spec.get("cycles") or 1)
+    if not 1 <= cycles <= 20:
+        raise ValueError("gif_loops must be between 1 and 20")
     bg = hex_colour(spec.get("background", "#8a8a90")) + (255,)
     zoom = int(spec.get("zoom", 4))
     frames = []
@@ -694,9 +699,308 @@ def op_animate(spec: dict) -> dict:
         if len(spec["durations"]) != len(frames):
             raise ValueError("give one duration per frame")
         duration = [max(20, int(d)) for d in spec["durations"]]
+    one_cycle = duration
+    if cycles > 1:
+        frames = frames * cycles
+        if isinstance(duration, list):
+            duration = duration * cycles
     frames[0].save(spec["output"], save_all=True, append_images=frames[1:], duration=duration,
                    loop=0 if spec.get("loop", True) else 1, disposal=1)
-    return {"path": spec["output"], "frames": len(frames), "duration_ms": duration}
+    return {"path": spec["output"], "frames": len(frames) // cycles, "cycles": cycles, "duration_ms": one_cycle}
+
+
+# -- sheet import ------------------------------------------------------------
+#
+# A sprite sheet drawn by another image model, an artist or another tool: frames on a flat
+# background, roughly in a grid but not on an exact one. The frames are found as row bands and
+# then column runs of foreground pixels, read left to right and top to bottom, and each is moved
+# onto one square canvas: its lowest pixel on a common ground line and the middle of its torso
+# band on a common vertical, so pixelizing every canvas with fit="frame" keeps one scale and the
+# motion between frames, without the jitter of each frame's own framing.
+
+SHEET_DETECT = 60          # summed |RGB - background| above this counts as a frame when finding cells
+SHEET_KEY = 45             # ... and above this is kept when the background is keyed out
+SHEET_FRAGMENT = 0.4       # a run shorter than this share of the typical run is a piece of a neighbour
+SHEET_SPECK = 0.02         # a run with under this share of the largest run's pixels is noise
+SHEET_SPLIT = 1.6          # a column run this many times the typical width holds touching frames
+TORSO_BAND = (0.35, 0.6)   # rows of a frame's own height whose median column is its anchor
+SHADOW_ZONE = 0.1          # bottom share of a frame searched for a flat grey ground shadow
+SHADOW_CHROMA = 14         # a shadow pixel is grey: max - min channel at most this
+SHADOW_MAX = 240           # ... and differs from the background by less than this (outlines differ more)
+CANVAS_PAD = 1.12          # canvas side over the larger of frame height and width round the anchor
+
+
+def sheet_background(rgb: np.ndarray, border: int = 8) -> np.ndarray:
+    """The flat background colour: the median of a strip round the sheet's edge."""
+    b = max(1, min(border, rgb.shape[0] // 4, rgb.shape[1] // 4))
+    edge = np.concatenate([rgb[:b].reshape(-1, 3), rgb[-b:].reshape(-1, 3),
+                           rgb[:, :b].reshape(-1, 3), rgb[:, -b:].reshape(-1, 3)])
+    return np.median(edge, axis=0)
+
+
+def spans(profile: np.ndarray) -> list[list[int]]:
+    """[start, end) runs where profile is True."""
+    padded = np.concatenate([[False], profile.astype(bool), [False]])
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return [[int(a), int(b)] for a, b in zip(edges[::2], edges[1::2])]
+
+
+def _merge(runs: list[list[int]], i: int) -> None:
+    """Merge run i into the neighbour across the smaller gap."""
+    left = runs[i][0] - runs[i - 1][1] if i > 0 else None
+    right = runs[i + 1][0] - runs[i][1] if i + 1 < len(runs) else None
+    j = i - 1 if right is None or (left is not None and left <= right) else i + 1
+    a, b = sorted((i, j))
+    runs[a] = [runs[a][0], runs[b][1]]
+    del runs[b]
+
+
+def clean_runs(mask: np.ndarray, axis: int, notes: list[str], what: str) -> list[list[int]]:
+    """Runs of mask along axis (0: rows, 1: columns) with specks dropped and fragments (a detached
+    hat, the far end of a tool) merged into the nearer neighbour."""
+    counts = mask.sum(axis=1 - axis)
+    runs = spans(counts >= 2)
+    if not runs:
+        return []
+    mass = [int(counts[a:b].sum()) for a, b in runs]
+    keep = [r for r, m in zip(runs, mass) if m >= SHEET_SPECK * max(mass)]
+    if len(keep) < len(runs):
+        notes.append(f"ignored {len(runs) - len(keep)} speck(s) when finding {what}")
+    runs = keep
+    while len(runs) > 1:
+        typical = float(np.median([b - a for a, b in runs]))
+        short = [i for i, (a, b) in enumerate(runs) if b - a < SHEET_FRAGMENT * typical]
+        if not short:
+            break
+        _merge(runs, min(short, key=lambda i: runs[i][1] - runs[i][0]))
+        notes.append(f"joined a narrow piece to a neighbouring {what[:-1]}")
+    return runs
+
+
+def split_wide(runs: list[list[int]], profile: np.ndarray, notes: list[str]) -> list[list[int]]:
+    """Split column runs much wider than the typical one (frames that touch) at profile minima. A
+    run with an empty column inside is a frame with a piece joined to it, and is never split."""
+    if len(runs) < 2:
+        return runs
+    typical = float(np.median([b - a for a, b in runs]))
+    out = []
+    for a, b in runs:
+        parts = int(round((b - a) / typical))
+        if (b - a) < SHEET_SPLIT * typical or parts < 2 or (profile[a:b] < 2).any():
+            out.append([a, b])
+            continue
+        cuts = []
+        for k in range(1, parts):
+            centre = a + (b - a) * k // parts
+            lo, hi = max(a + 1, centre - int(typical * 0.3)), min(b - 1, centre + int(typical * 0.3))
+            cuts.append(lo + int(np.argmin(profile[lo:hi])) if hi > lo else centre)
+        edges = [a, *cuts, b]
+        out.extend([[edges[k], edges[k + 1]] for k in range(parts)])
+        notes.append(f"split a run {b - a} px wide into {parts} touching frames")
+    return out
+
+
+def find_cells(fg: np.ndarray, rows: int | None, notes: list[str]) -> list[list[tuple[int, int, int, int]]]:
+    """Frame boxes (y0, y1, x0, x1) per row band, top to bottom and left to right."""
+    bands = clean_runs(fg, 0, notes, "rows")
+    if rows and len(bands) > rows:
+        while len(bands) > rows:
+            gaps = [bands[i + 1][0] - bands[i][1] for i in range(len(bands) - 1)]
+            i = int(np.argmin(gaps))
+            bands[i] = [bands[i][0], bands[i + 1][1]]
+            del bands[i + 1]
+        notes.append(f"joined row bands to make the {rows} rows asked for")
+    grid = []
+    for y0, y1 in bands:
+        band = fg[y0:y1]
+        cols = clean_runs(band, 1, notes, "frames")
+        cols = split_wide(cols, band.sum(0), notes)
+        grid.append([(y0, y1, x0, x1) for x0, x1 in cols])
+    return grid
+
+
+def subject_rows(alpha: np.ndarray) -> tuple[int, int] | None:
+    ys = np.flatnonzero(alpha.any(1))
+    return (int(ys[0]), int(ys[-1]) + 1) if len(ys) else None
+
+
+def remove_ground_shadow(rgb: np.ndarray, diff: np.ndarray, alpha: np.ndarray, bg: np.ndarray) -> int:
+    """Clear flat grey pixels a little darker than the background in the bottom of a frame (a drawn
+    ground shadow or ground line). Returns the number of pixels cleared."""
+    rows = subject_rows(alpha)
+    if rows is None:
+        return 0
+    top, bottom = rows
+    zone = np.zeros_like(alpha)
+    zone[max(top, bottom - max(2, int(round(SHADOW_ZONE * (bottom - top))))):bottom] = True
+    chroma = rgb.max(-1) - rgb.min(-1)
+    shadow = zone & alpha & (chroma <= SHADOW_CHROMA) & (diff < SHADOW_MAX) & (rgb <= bg + 4).all(-1)
+    alpha &= ~shadow
+    return int(shadow.sum())
+
+
+def torso_anchor(alpha: np.ndarray) -> float:
+    """The median column of the frame's torso band (rows TORSO_BAND of its own height), which a
+    swinging tool or a stride moves far less than the frame's box or its centre of mass."""
+    top, bottom = subject_rows(alpha)
+    h = bottom - top
+    band = alpha[top + int(h * TORSO_BAND[0]):top + max(int(h * TORSO_BAND[1]), int(h * TORSO_BAND[0]) + 1)]
+    xs = np.nonzero(band)[1]
+    if len(xs) == 0:
+        xs = np.nonzero(alpha)[1]
+    return float(np.median(xs))
+
+
+def sheet_overlay(rgb: np.ndarray, frames: list[dict], path) -> str:
+    """The sheet with each frame's box and number in red, and, once aligned, its anchor column in
+    blue and its ground line in green."""
+    ov = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
+    draw = ImageDraw.Draw(ov)
+    font = _font(max(14, rgb.shape[0] // 40))
+    for i, f in enumerate(frames):
+        y0, y1, x0, x1 = f["box"]
+        draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=(220, 40, 40), width=3)
+        if "anchor" in f:
+            ax = x0 + int(round(f["anchor"]))
+            draw.line([ax, y0, ax, y1], fill=(40, 120, 220), width=2)
+            draw.line([x0, y0 + f["bottom"], x1, y0 + f["bottom"]], fill=(40, 170, 60), width=2)
+        draw.text((x0 + 4, y0 + 2), str(i), fill=(220, 40, 40), font=font)
+    ov.save(path)
+    return str(path)
+
+
+def op_import_sheet(spec: dict) -> dict:
+    """spec: input (sheet image), frames (expected count or None), rows (or None), columns (or None),
+    background ("key": key out the flat background; "keep": cells keep it, for a BiRefNet cut-out
+    after), key_threshold, shadow (clear a flat grey ground shadow), on_mismatch ("fail" or
+    "keep"), output_prefix (cells are written as <prefix>_cNN.png), overlay (optional path: the
+    sheet with the boxes found, for review).
+
+    Frames are read left to right, then top to bottom. With frames given and a different count
+    found, "fail" raises a ValueError that says what was found; "keep" carries on and reports it."""
+    rgba = np.asarray(_open(spec["input"]), dtype=np.int32)
+    if (rgba[..., 3] < 255).any():
+        # A sheet with real transparency: its alpha is the mask; flatten on grey for the cells.
+        bg = np.array([216.0, 216.0, 216.0])
+        a = rgba[..., 3:4] / 255.0
+        rgb = np.rint(rgba[..., :3] * a + bg * (1 - a)).astype(np.int32)
+        diff = np.where(rgba[..., 3] >= 128, 765, 0)
+    else:
+        rgb = rgba[..., :3]
+        bg = sheet_background(rgb)
+        diff = np.abs(rgb - bg).sum(-1)
+    notes: list[str] = []
+    rows_req = int(spec["rows"]) if spec.get("rows") else None
+    cols_req = int(spec["columns"]) if spec.get("columns") else None
+    expected = int(spec["frames"]) if spec.get("frames") else (rows_req * cols_req if rows_req and cols_req else None)
+    grid = find_cells(diff > SHEET_DETECT, rows_req, notes)
+    per_row = [len(r) for r in grid]
+    found = sum(per_row)
+    problems = []
+    if found == 0:
+        raise ValueError("no frames found: the sheet looks like one flat colour")
+    if expected is not None and found != expected:
+        problems.append(f"found {found} frames but {expected} were expected")
+    if rows_req and len(grid) != rows_req:
+        problems.append(f"found {len(grid)} rows but {rows_req} were asked for")
+    if cols_req and any(n > cols_req for n in per_row):
+        problems.append(f"a row holds more than the {cols_req} columns asked for")
+    if problems and spec.get("on_mismatch", "fail") == "fail":
+        if spec.get("overlay"):
+            sheet_overlay(rgb, [{"box": c} for row in grid for c in row], spec["overlay"])
+        raise ValueError("; ".join(problems) + f" (frames per row found: {per_row}). Check the sheet and the "
+                         "overlay, or pass the count found, or on_count_mismatch=\"keep\"")
+    keyed = spec.get("background", "key") == "key"
+    key = float(spec.get("key_threshold", SHEET_KEY))
+    frames = []
+    for y0, y1, x0, x1 in (cell for row in grid for cell in row):
+        sub, d = rgb[y0:y1, x0:x1], diff[y0:y1, x0:x1]
+        alpha = d > key
+        cleared = remove_ground_shadow(sub, d, alpha, bg) if spec.get("shadow", True) else 0
+        if subject_rows(alpha) is None:
+            alpha = d > SHEET_DETECT
+        top, bottom = subject_rows(alpha)
+        xs = np.flatnonzero(alpha.any(0))
+        frames.append({"box": (y0, y1, x0, x1), "alpha": alpha, "top": top, "bottom": bottom,
+                       "left": int(xs[0]), "right": int(xs[-1]) + 1, "anchor": torso_anchor(alpha),
+                       "shadow_pixels": cleared})
+    height = max(f["bottom"] - f["top"] for f in frames)
+    half = max(max(f["anchor"] - f["left"], f["right"] - f["anchor"]) for f in frames)
+    side = int(math.ceil(max(height, 2 * half) * CANVAS_PAD))
+    margin = max(2, int(round(0.03 * side)))
+    ground, centre = side - margin, side // 2
+    prefix = spec["output_prefix"]
+    cells, report = [], []
+    bg_u8 = np.clip(np.rint(bg), 0, 255).astype(np.uint8)
+    for i, f in enumerate(frames):
+        y0, y1, x0, x1 = f["box"]
+        dx = centre - int(round(f["anchor"]))
+        dy = ground - f["bottom"]
+        canvas = np.zeros((side, side, 4), dtype=np.uint8)
+        if not keyed:
+            canvas[..., :3], canvas[..., 3] = bg_u8, 255
+        h, w = y1 - y0, x1 - x0
+        # Destination window of this cell on the canvas, clipped.
+        ty0, tx0 = max(0, dy), max(0, dx)
+        ty1, tx1 = min(side, h + dy), min(side, w + dx)
+        if ty1 > ty0 and tx1 > tx0:
+            src = (slice(ty0 - dy, ty1 - dy), slice(tx0 - dx, tx1 - dx))
+            a = f["alpha"][src]
+            win = canvas[ty0:ty1, tx0:tx1]
+            px = rgb[y0:y1, x0:x1][src].astype(np.uint8)
+            if keyed:
+                win[a, :3], win[a, 3] = px[a], 255
+            else:
+                win[..., :3] = px
+        path = f"{prefix}_c{i:02d}.png"
+        save_png(canvas, path)
+        cells.append(path)
+        report.append({"frame": i, "row": next(r for r, row in enumerate(grid) if f["box"] in row),
+                       "sheet_box": [x0, y0, x1, y1], "subject_height": f["bottom"] - f["top"],
+                       "ground_shadow_pixels": f["shadow_pixels"]})
+    if spec.get("overlay"):
+        sheet_overlay(rgb, frames, spec["overlay"])
+    return {"cells": cells, "frames_found": found, "frames_expected": expected, "rows_found": len(grid),
+            "per_row": per_row, "count_ok": not problems, "problems": problems, "background": to_hex(bg_u8),
+            "canvas": side, "ground_line": ground, "anchor_column": centre, "notes": notes, "frames": report,
+            "overlay": spec.get("overlay")}
+
+
+def op_grid(spec: dict) -> dict:
+    """spec: images [paths], columns, canvas [w, h] (optional), background (#rrggbb), output: the
+    images laid out left to right, top to bottom on one sheet. Without canvas every cell is the
+    first image's size; with it, the canvas is split into equal cells and each image is scaled to
+    fit its cell (aspect kept, centred), so the sheet matches the size another model draws at."""
+    paths = spec["images"]
+    if not paths:
+        raise ValueError("no images to lay out")
+    cols = max(1, min(int(spec.get("columns") or len(paths)), len(paths)))
+    rows = math.ceil(len(paths) / cols)
+    first = _open(paths[0])
+    bg = hex_colour(spec.get("background", "#d8d8d8")) + (255,)
+    if spec.get("canvas"):
+        width, height = (int(v) for v in spec["canvas"])
+        if not (64 <= width <= 4096 and 64 <= height <= 4096):
+            raise ValueError("sheet_size must be 64 to 4096 pixels a side")
+        cw, ch = width // cols, height // rows
+    else:
+        cw, ch = first.size
+        width, height = cw * cols, ch * rows
+    if width * height > MAX_PIXELS:
+        raise ValueError(f"the sheet would be {width}x{height}; at most {MAX_PIXELS} pixels")
+    sheet = Image.new("RGBA", (width, height), bg)
+    boxes = []
+    for i, p in enumerate(paths):
+        im = _open(p)
+        k = min(cw / im.width, ch / im.height)
+        if abs(k - 1) > 1e-6:
+            im = im.resize((max(1, round(im.width * k)), max(1, round(im.height * k))), Image.LANCZOS)
+        x = (i % cols) * cw + (cw - im.width) // 2
+        y = (i // cols) * ch + (ch - im.height) // 2
+        sheet.alpha_composite(im, (x, y))
+        boxes.append([(i % cols) * cw, (i // cols) * ch, cw, ch])
+    sheet.convert("RGB").save(spec["output"])
+    return {"path": spec["output"], "columns": cols, "rows": rows, "size": [width, height], "cells": boxes}
 
 
 # -- pose guides -------------------------------------------------------------
@@ -1024,7 +1328,7 @@ def op_pose_guides(spec: dict) -> dict:
 
 
 OPS = {"pixelize": op_pixelize, "metrics": op_metrics, "pack": op_pack, "flatten": op_flatten,
-       "animate": op_animate, "pose_guides": op_pose_guides}
+       "animate": op_animate, "pose_guides": op_pose_guides, "import_sheet": op_import_sheet, "grid": op_grid}
 
 
 def main(argv: list[str]) -> int:
