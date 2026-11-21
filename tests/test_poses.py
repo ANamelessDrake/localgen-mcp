@@ -153,6 +153,22 @@ def test_forward_kinematics_gives_back_the_positions():
     assert np.abs(pos - np.asarray(clip["frames"]["positions"])).max() < 1e-4
 
 
+def test_positions_win_when_the_edge_bone_does_not_explain_a_segment():
+    """A segment can move through a bone the mapping skipped (a middle spine bone): here the right
+    upper arm's bone reports no rotation at all while the arm swings. The clip still reproduces the
+    sampled positions, because each segment's rotation is lined up with where its joint really is."""
+    raw = pf.synthetic_raw()
+    k = raw["bones"].index("b_elbow_r")
+    rots = np.asarray(raw["rotations"])
+    rots[:, k] = raw["rest_rotations"][k]
+    raw["rotations"] = rots.tolist()
+    clip = pm.build_clip(raw, name="skipped")
+    a = pm.arrays(clip)
+    pos, _ = pm.forward(a["offsets"], a["local"], a["root_position"])
+    assert np.abs(pos - np.asarray(clip["frames"]["positions"])).max() < 1e-4
+    assert pm.qangle(a["local"][pf.STRIKE, pm.INDEX["elbow_r"]]) == pytest.approx(90.0, abs=0.5)
+
+
 @pytest.mark.parametrize("yaw", [90.0, 180.0, -35.0])
 def test_facing_floor_and_root_motion_are_normalised(yaw):
     base = pf.synthetic_clip()
