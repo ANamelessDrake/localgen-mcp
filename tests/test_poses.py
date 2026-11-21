@@ -213,6 +213,29 @@ def test_chop_impact_is_where_the_blow_stops_not_the_top_of_the_swing():
     assert {k["label"]: k["frame"] for k in meta["key_frames"]}["wind_up"] == 8
 
 
+def periodic_walk(frames: int, period: int) -> dict:
+    """A clip whose hands and feet swing with the given period (as a walk recorded over several strides)."""
+    base = np.asarray(pf.synthetic_clip()["frames"]["positions"])[0]
+    t = np.arange(frames)[:, None]
+    pos = np.repeat(base[None], frames, 0)
+    swing = 0.25 * np.sin(2 * np.pi * t / period)
+    for j, sign in (("toe_l", 1), ("ankle_l", 1), ("hand_r", 1), ("toe_r", -1), ("ankle_r", -1), ("hand_l", -1)):
+        pos[:, pm.INDEX[j], 1] += sign * swing[:, 0]
+    return {"frames": {"positions": pos.tolist()}, "fps": 30.0, "rest": {"stature": 1.75}}
+
+
+def test_a_loop_holding_two_cycles_is_cut_to_one():
+    two = pm.analyse(periodic_walk(41, 20), name="walk_two_strides")
+    assert two["cycle_frames"] == 20 and two["last_frame_repeats_first"]
+    sel = pm.select_frames(two, 41, 5)
+    assert sel["frames"] == [0, 4, 8, 12, 16]
+    one = pm.analyse(periodic_walk(21, 20), name="walk_one_stride")
+    assert one["cycle_frames"] == 20                       # one cycle: only the repeated last frame goes
+    still = pm.analyse(periodic_walk(41, 20) | {"frames": {"positions": np.repeat(
+        np.asarray(pf.synthetic_clip()["frames"]["positions"])[:1], 41, 0).tolist()}}, name="idle")
+    assert still["cycle_frames"] == 40                     # a pose that does not move is never split
+
+
 def test_names_set_action_loop_and_hand():
     meta = pf.synthetic_clip(name="HammeringGround01_L - Loop")["metadata"]
     assert (meta["action"], meta["loop"], meta["weapon_hand"], meta["weapon_hand_source"]) == \

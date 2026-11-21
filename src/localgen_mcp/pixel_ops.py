@@ -1002,7 +1002,7 @@ def op_pose_guides(spec: dict) -> dict:
         draw_guide(prims, cam, scale, origin, (width, height), background).save(out)
         paths.append(str(out))
     fps = float(clip["fps"])
-    usable = frame_count - 1 if meta.get("last_frame_repeats_first") else frame_count
+    usable = pm.cycle_length(meta, frame_count)
     picked = sel["frames"]
     steps = [(picked[i + 1] - picked[i]) for i in range(len(picked) - 1)]
     if meta.get("loop"):

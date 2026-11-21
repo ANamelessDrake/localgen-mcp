@@ -85,6 +85,8 @@ ACTION_WORDS = (  # first match wins, so "BlockShield01 - Hit" is a block and no
 STRIKES = ("attack", "chop", "hammer")
 STOP_SHARE = 0.25   # a strike's hand "stops" when it moves under this share of its peak speed
 STOP_WINDOW = 6     # frames after the peak in which to look for the stop
+CYCLE_MATCH = 0.03  # a loop repeats when the pose comes back within this share of stature
+CYCLE_MOTION = 0.05  # a loop moving less than this share of stature is never split into cycles
 LOOPING = ("walk", "run", "idle")
 
 
@@ -639,6 +641,26 @@ def hand_from_name(name: str) -> str | None:
     return {"L": "left", "R": "right"}[m.group(1).upper()] if m else None
 
 
+def find_cycle(pos: np.ndarray, stature: float, usable: int) -> int | None:
+    """The length in frames of a cycle that repeats inside a looping clip (a walk recorded as two
+    strides), or None when the clip is one cycle. A lag counts when the pose, relative to the
+    pelvis, comes back within CYCLE_MATCH of stature on average and that is a local minimum well
+    below the clip's largest change; a clip that barely moves is never split."""
+    rel = pos[:usable] - pos[:usable, :1]
+    lags = list(range(max(2, usable // 6), usable - 3))
+    if not lags:
+        return None
+    d = np.array([float(np.mean(np.linalg.norm(rel[:usable - L] - rel[L:usable], axis=-1))) for L in lags])
+    if d.max() < CYCLE_MOTION * stature:
+        return None
+    for i, L in enumerate(lags):
+        left = d[i - 1] if i > 0 else np.inf
+        right = d[i + 1] if i + 1 < len(d) else np.inf
+        if d[i] < CYCLE_MATCH * stature and d[i] < 0.2 * d.max() and d[i] <= left and d[i] <= right:
+            return L
+    return None
+
+
 def _speed(p: np.ndarray, fps: float) -> np.ndarray:
     if len(p) < 2:
         return np.zeros(len(p))
@@ -668,6 +690,9 @@ def analyse(clip: dict, *, name: str, action: str | None = None, loop: bool | No
     is_loop = bool(loop) if loop is not None else (named_loop or tag in LOOPING)
     repeats = bool(is_loop and frames > 2 and ends < 0.02)
     usable = frames - 1 if repeats else frames
+    cycle = find_cycle(pos, stature, usable) if is_loop and frames >= 8 else None
+    if cycle:
+        usable = cycle  # key frames and frame selection use the first cycle
     J = INDEX
     hand_src = "given"
     if weapon_hand is None:
@@ -751,8 +776,17 @@ def analyse(clip: dict, *, name: str, action: str | None = None, loop: bool | No
             seen.add(f)
             ordered.append({"frame": f, "label": label})
     return {"action": tag, "loop": is_loop, "ends_match": round(ends, 4), "last_frame_repeats_first": repeats,
+            "cycle_frames": usable,
             "impact_frame": impact, "key_frames": ordered, "weapon_hand": weapon_hand,
             "weapon_hand_source": hand_src, "stature": round(stature, 4), "duration": round(frames / fps, 4)}
+
+
+def cycle_length(meta: dict, frame_count: int) -> int:
+    """Frames that make one pass of the clip: one cycle of a loop (without a last frame that repeats
+    the first), or every frame of a one shot."""
+    if meta.get("cycle_frames"):
+        return max(1, min(int(meta["cycle_frames"]), frame_count))
+    return max(1, frame_count - 1 if meta.get("last_frame_repeats_first") else frame_count)
 
 
 KEY_PRIORITY = ("impact", "ground", "wind_up", "start", "recover", "contact_left", "contact_right",
@@ -762,8 +796,8 @@ KEY_PRIORITY = ("impact", "ground", "wind_up", "start", "recover", "contact_left
 def select_frames(meta: dict, frame_count: int, n: int, mode: str = "auto") -> dict:
     """Which clip frames to draw for an n frame animation.
 
-    "even": n frames evenly spaced over the cycle (a loop leaves out a last frame that repeats the
-    first; a one shot runs first to last). "keys": the clip's key frames, the impact always among
+    "even": n frames evenly spaced over one cycle (a loop leaves out a last frame that repeats the
+    first, and a clip holding several cycles uses the first; a one shot runs first to last). "keys": the clip's key frames, the impact always among
     them: with more frames than keys the largest gaps are split, with fewer the keys are kept in
     priority order (impact first). "auto": even for loops, keys otherwise.
     Returns {"frames": [clip frame per output frame], "labels": [...], "impact_index": output index or None}."""
@@ -772,8 +806,7 @@ def select_frames(meta: dict, frame_count: int, n: int, mode: str = "auto") -> d
     if mode not in ("auto", "even", "keys"):
         raise PoseError('frame selection must be "auto", "even" or "keys"')
     loop = bool(meta.get("loop"))
-    usable = frame_count - 1 if meta.get("last_frame_repeats_first") else frame_count
-    usable = max(usable, 1)
+    usable = cycle_length(meta, frame_count)
     if mode == "auto":
         mode = "even" if loop or not meta.get("key_frames") else "keys"
     labels_at = {k["frame"]: k["label"] for k in meta.get("key_frames") or []}
