@@ -126,6 +126,14 @@ def test_a_detached_piece_joins_its_frame_and_touching_frames_are_split(tmp_path
     res = run(tmp_path, src, frames=5)
     assert res["count_ok"] and any("narrow piece" in n for n in res["notes"])
     assert res["frames"][2]["sheet_box"][0] == 450 and not any("split" in n for n in res["notes"])
+
+    def far_piece(canvas):  # a piece 60 px right of frame 1 (its tool ends at x 438): joined, the
+        canvas.paste((60, 60, 70, 255), (498, 60, 512, 90))  # frame is then about twice the typical width
+
+    src = sheet(tmp_path / "far.png", [[(20 + 300 * i, 20) for i in range(5)]], width=1600, extra=far_piece)
+    res = run(tmp_path, src, frames=5)
+    assert res["frames"][1]["sheet_box"][2] == 512
+    assert res["count_ok"] and not any("split" in n for n in res["notes"])   # a joined piece is never split
     # Two frames whose subjects touch (each is 50 px wide from x + 55): one run twice as wide, split.
     xs = [20, 200, 250, 560, 740]
     src = sheet(tmp_path / "touch.png", [[(x, 20) for x in xs]], stride=lambda i: 0)
